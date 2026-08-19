@@ -1,16 +1,14 @@
 import rclpy
 from rclpy.node import Node
 import numpy as np
+
 from sensor_msgs.msg import JointState
 from geometry_msgs.msg import TwistStamped
-from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
-from builtin_interfaces.msg import Duration
 
 class UR3eTaskSpaceController(Node):
     def __init__(self):
         super().__init__('ur3e_task_space_controller')
 
-        # Joint volgorde voor de UR3e
         self.joint_names = [
             'shoulder_pan_joint',
             'shoulder_lift_joint',
@@ -20,31 +18,31 @@ class UR3eTaskSpaceController(Node):
             'wrist_3_joint'
         ]
         
-        # UR3e DH-parameters (a, d, alpha in meters/radialen)
+        # UR3e DH-parameters
         self.d = np.array([0.15185, 0.0, 0.0, 0.13105, 0.08535, 0.0921])
         self.a = np.array([0.0, -0.24355, -0.2132, 0.0, 0.0, 0.0])
         self.alpha = np.array([np.pi/2, 0.0, 0.0, np.pi/2, -np.pi/2, 0.0])
 
-        self.current_q = None
+        # Fysieke limieten UR3e
+        self.q_min = np.array([-2*np.pi] * 6)
+        self.q_max = np.array([ 2*np.pi] * 6)
+        self.joint_buffer = np.radians(5.0)  # 5 graden veiligheidsmarge
+
+        # Cartesische werkruimte-grenzen (t.o.v. base_link in meters)
+        self.z_min = 0.02   # Voorkom botsen met tafel/grondvlak
+        self.r_max = 0.50   # Max bereik UR3e radius
+
+        # Beginpositie
+        self.current_q = np.array([0.0, -np.pi/2, np.pi/2, -np.pi/2, -np.pi/2, 0.0])
         self.target_twist = np.zeros(6)
-        self.damping = 0.05  # Damping factor lambda tegen singulariteiten
+        self.max_joint_vel = 1.0  # rad/s
 
-        # Subscribers
-        self.create_subscription(JointState, '/joint_states', self.joint_state_cb, 10)
         self.create_subscription(TwistStamped, '/target_twist', self.twist_cb, 10)
+        self.joint_pub = self.create_publisher(JointState, '/joint_states', 10)
 
-        # Publisher naar de Joint Trajectory Controller
-        self.cmd_pub = self.create_publisher(JointTrajectory, '/joint_trajectory_controller/joint_trajectory', 10)
-
-        # Control loop op 50 Hz
         self.dt = 0.02
         self.timer = self.create_timer(self.dt, self.control_loop)
-        self.get_logger().info("UR3e Task-Space Controller node gestart!")
-
-    def joint_state_cb(self, msg):
-        if all(name in msg.name for name in self.joint_names):
-            indices = [msg.name.index(name) for name in self.joint_names]
-            self.current_q = np.array([msg.position[i] for i in indices])
+        self.get_logger().info("UR3e Controller met Veiligheids- & Workspace-limieten actief!")
 
     def twist_cb(self, msg):
         self.target_twist = np.array([
@@ -52,22 +50,18 @@ class UR3eTaskSpaceController(Node):
             msg.twist.angular.x, msg.twist.angular.y, msg.twist.angular.z
         ])
 
-    def compute_jacobian(self, q):
+    def forward_kinematics(self, q):
         T = np.eye(4)
         z = [np.array([0, 0, 1])]
         p = [np.array([0, 0, 0])]
 
         for i in range(6):
             theta = q[i]
-            d = self.d[i]
-            a = self.a[i]
-            alpha = self.alpha[i]
-
             Ti = np.array([
-                [np.cos(theta), -np.sin(theta)*np.cos(alpha),  np.sin(theta)*np.sin(alpha), a*np.cos(theta)],
-                [np.sin(theta),  np.cos(theta)*np.cos(alpha), -np.cos(theta)*np.sin(alpha), a*np.sin(theta)],
-                [0,              np.sin(alpha),                np.cos(alpha),               d],
-                [0,              0,                            0,                           1]
+                [np.cos(theta), -np.sin(theta)*np.cos(self.alpha[i]),  np.sin(theta)*np.sin(self.alpha[i]), self.a[i]*np.cos(theta)],
+                [np.sin(theta),  np.cos(theta)*np.cos(self.alpha[i]), -np.cos(theta)*np.sin(self.alpha[i]), self.a[i]*np.sin(theta)],
+                [0,              np.sin(self.alpha[i]),                np.cos(self.alpha[i]),               self.d[i]],
+                [0,              0,                                    0,                                   1]
             ])
             T = T @ Ti
             z.append(T[0:3, 2])
@@ -78,33 +72,44 @@ class UR3eTaskSpaceController(Node):
         for i in range(6):
             J[0:3, i] = np.cross(z[i], (p_end - p[i]))
             J[3:6, i] = z[i]
-        return J
+        return p_end, J
 
     def control_loop(self):
-        if self.current_q is None:
-            return
+        if not np.allclose(self.target_twist, 0, atol=1e-4):
+            p_curr, J = self.forward_kinematics(self.current_q)
 
-        if np.allclose(self.target_twist, 0, atol=1e-4):
-            return
+            # Workspace Box check (Z-min limit)
+            twist_cmd = self.target_twist.copy()
+            if p_curr[2] <= self.z_min and twist_cmd[2] < 0:
+                twist_cmd[2] = 0.0  # Blokkeer verdere neerwaartse beweging
 
-        J = self.compute_jacobian(self.current_q)
+            # Adaptieve demping gebaseerd op manipuleerbaarheid w = sqrt(det(J*J^T))
+            w = np.sqrt(np.maximum(0.0, np.linalg.det(J @ J.T)))
+            damping = 0.02 if w > 0.05 else 0.02 + 0.1 * (1.0 - w / 0.05)
 
-        # Damped Least Squares: J_dls = J^T * (J * J^T + lambda^2 * I)^(-1)
-        lambda_sq = self.damping ** 2
-        J_dls = J.T @ np.linalg.inv(J @ J.T + lambda_sq * np.eye(6))
+            # Damped Least Squares
+            A = J @ J.T + (damping ** 2) * np.eye(6)
+            q_dot = J.T @ np.linalg.solve(A, twist_cmd)
 
-        q_dot = J_dls @ self.target_twist
-        q_next = self.current_q + q_dot * self.dt
+            # Proportionele snelheidsbegrenzing
+            max_val = np.max(np.abs(q_dot))
+            if max_val > self.max_joint_vel:
+                q_dot = q_dot * (self.max_joint_vel / max_val)
 
-        traj = JointTrajectory()
-        traj.joint_names = self.joint_names
-        point = JointTrajectoryPoint()
-        point.positions = q_next.tolist()
-        point.velocities = q_dot.tolist()
-        point.time_from_start = Duration(sec=0, nanosec=int(self.dt * 1e9))
-        traj.points.append(point)
+            # Joint limit stop (voorkom doordraaien buiten [-2pi, 2pi])
+            for i in range(6):
+                if self.current_q[i] <= (self.q_min[i] + self.joint_buffer) and q_dot[i] < 0:
+                    q_dot[i] = 0.0
+                elif self.current_q[i] >= (self.q_max[i] - self.joint_buffer) and q_dot[i] > 0:
+                    q_dot[i] = 0.0
 
-        self.cmd_pub.publish(traj)
+            self.current_q += q_dot * self.dt
+
+        msg = JointState()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.name = self.joint_names
+        msg.position = self.current_q.tolist()
+        self.joint_pub.publish(msg)
 
 def main(args=None):
     rclpy.init(args=args)

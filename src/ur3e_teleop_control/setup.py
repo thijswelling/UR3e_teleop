@@ -24,7 +24,8 @@ setup(
     },
     entry_points={
         'console_scripts': [
-		'task_space_controller = ur3e_teleop_control.task_space_contoller:main',
+		'task_space_controller = ur3e_teleop_control.task_space_controller:main',
+        'keyboard_teleop = ur3e_teleop_control.keyboard_teleop:main',
 	],
     },
 )
