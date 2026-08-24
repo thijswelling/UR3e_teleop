@@ -1,3 +1,5 @@
+import os
+from glob import glob
 from setuptools import find_packages, setup
 
 package_name = 'ur3e_teleop_control'
@@ -7,25 +9,21 @@ setup(
     version='0.0.0',
     packages=find_packages(exclude=['test']),
     data_files=[
-        ('share/ament_index/resource_index/packages',
-            ['resource/' + package_name]),
+        ('share/ament_index/resource_index/packages', ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
+        (os.path.join('share', package_name, 'launch'), glob('launch/*.launch.py')),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
     maintainer='thijs',
-    maintainer_email='thijs@todo.todo',
-    description='TODO: Package description',
-    license='TODO: License declaration',
-    extras_require={
-        'test': [
-            'pytest',
-        ],
-    },
+    maintainer_email='t.welling@student.tue.nl',
+    description='Teleoperation of UR3e using 3D Systems Touch and MoveIt Servo',
+    license='Apache License 2.0',
+    tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-		'task_space_controller = ur3e_teleop_control.task_space_controller:main',
-        'keyboard_teleop = ur3e_teleop_control.keyboard_teleop:main',
-	],
+            'touch_publisher = ur3e_teleop_control.touch_publisher:main',
+            'task_space_controller = ur3e_teleop_control.task_space_controller:main',
+        ],
     },
 )

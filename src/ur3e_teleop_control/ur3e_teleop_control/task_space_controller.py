@@ -4,8 +4,9 @@ import numpy as np
 
 from sensor_msgs.msg import JointState
 from geometry_msgs.msg import TwistStamped
+from std_msgs.msg import Bool
 
-class UR3eTaskSpaceController(Node):
+class UR3eDecoupled6DOFController(Node):
     def __init__(self):
         super().__init__('ur3e_task_space_controller')
 
@@ -17,93 +18,93 @@ class UR3eTaskSpaceController(Node):
             'wrist_2_joint',
             'wrist_3_joint'
         ]
-        
-        # UR3e DH-parameters
+
         self.d = np.array([0.15185, 0.0, 0.0, 0.13105, 0.08535, 0.0921])
         self.a = np.array([0.0, -0.24355, -0.2132, 0.0, 0.0, 0.0])
         self.alpha = np.array([np.pi/2, 0.0, 0.0, np.pi/2, -np.pi/2, 0.0])
 
-        # Fysieke limieten UR3e
-        self.q_min = np.array([-2*np.pi] * 6)
-        self.q_max = np.array([ 2*np.pi] * 6)
-        self.joint_buffer = np.radians(5.0)  # 5 graden veiligheidsmarge
-
-        # Cartesische werkruimte-grenzen (t.o.v. base_link in meters)
-        self.z_min = 0.02   # Voorkom botsen met tafel/grondvlak
-        self.r_max = 0.50   # Max bereik UR3e radius
-
-        # Beginpositie
-        self.current_q = np.array([0.0, -np.pi/2, np.pi/2, -np.pi/2, -np.pi/2, 0.0])
+        # Vaste beginstand
+        self.home_q = np.array([0.0, -np.pi/2, np.pi/2, -np.pi/2, -np.pi/2, 0.0])
+        self.current_q = self.home_q.copy()
         self.target_twist = np.zeros(6)
-        self.max_joint_vel = 1.0  # rad/s
-
-        self.create_subscription(TwistStamped, '/target_twist', self.twist_cb, 10)
-        self.joint_pub = self.create_publisher(JointState, '/joint_states', 10)
 
         self.dt = 0.02
+        self.max_joint_vel = 1.5
+
+        self.create_subscription(TwistStamped, '/target_twist', self.twist_cb, 10)
+        self.create_subscription(Bool, '/reset_home', self.reset_cb, 10)
+        self.joint_pub = self.create_publisher(JointState, '/joint_states', 10)
+
         self.timer = self.create_timer(self.dt, self.control_loop)
-        self.get_logger().info("UR3e Controller met Veiligheids- & Workspace-limieten actief!")
+        self.get_logger().info("UR3e 6-DOF Velocity Controller met Auto-Home actief!")
 
     def twist_cb(self, msg):
         self.target_twist = np.array([
-            msg.twist.linear.x, msg.twist.linear.y, msg.twist.linear.z,
-            msg.twist.angular.x, msg.twist.angular.y, msg.twist.angular.z
+            msg.twist.linear.x,
+            msg.twist.linear.y,
+            msg.twist.linear.z,
+            msg.twist.angular.x,
+            msg.twist.angular.y,
+            msg.twist.angular.z
         ])
 
-    def forward_kinematics(self, q):
+    def reset_cb(self, msg):
+        if msg.data:
+            # Zachte overgang terug naar exacte homepositie
+            self.current_q += 0.15 * (self.home_q - self.current_q)
+
+    def get_dh_matrix(self, theta, d, a, alpha):
+        ct = np.cos(theta)
+        st = np.sin(theta)
+        ca = np.cos(alpha)
+        sa = np.sin(alpha)
+        return np.array([
+            [ct, -st * ca,  st * sa, a * ct],
+            [st,  ct * ca, -ct * sa, a * st],
+            [0,   sa,       ca,      d],
+            [0,   0,        0,       1.0]
+        ])
+
+    def compute_arm_jacobian(self, q):
         T = np.eye(4)
-        z = [np.array([0, 0, 1])]
-        p = [np.array([0, 0, 0])]
+        origins = [T[0:3, 3]]
+        z_axes = [T[0:3, 2]]
 
-        for i in range(6):
-            theta = q[i]
-            Ti = np.array([
-                [np.cos(theta), -np.sin(theta)*np.cos(self.alpha[i]),  np.sin(theta)*np.sin(self.alpha[i]), self.a[i]*np.cos(theta)],
-                [np.sin(theta),  np.cos(theta)*np.cos(self.alpha[i]), -np.cos(theta)*np.sin(self.alpha[i]), self.a[i]*np.sin(theta)],
-                [0,              np.sin(self.alpha[i]),                np.cos(self.alpha[i]),               self.d[i]],
-                [0,              0,                                    0,                                   1]
-            ])
+        for i in range(3):
+            Ti = self.get_dh_matrix(q[i], self.d[i], self.a[i], self.alpha[i])
             T = T @ Ti
-            z.append(T[0:3, 2])
-            p.append(T[0:3, 3])
+            origins.append(T[0:3, 3])
+            z_axes.append(T[0:3, 2])
 
-        p_end = p[-1]
-        J = np.zeros((6, 6))
-        for i in range(6):
-            J[0:3, i] = np.cross(z[i], (p_end - p[i]))
-            J[3:6, i] = z[i]
-        return p_end, J
+        p_wrist = origins[-1]
+        J_arm = np.zeros((3, 3))
+        for i in range(3):
+            J_arm[:, i] = np.cross(z_axes[i], (p_wrist - origins[i]))
+
+        return J_arm
 
     def control_loop(self):
-        if not np.allclose(self.target_twist, 0, atol=1e-4):
-            p_curr, J = self.forward_kinematics(self.current_q)
+        v_lin = self.target_twist[0:3]
+        w_ang = self.target_twist[3:6]
 
-            # Workspace Box check (Z-min limit)
-            twist_cmd = self.target_twist.copy()
-            if p_curr[2] <= self.z_min and twist_cmd[2] < 0:
-                twist_cmd[2] = 0.0  # Blokkeer verdere neerwaartse beweging
+        # 1. Arm translatie
+        J_arm = self.compute_arm_jacobian(self.current_q[0:3])
+        damping = 0.02
+        A = J_arm @ J_arm.T + (damping ** 2) * np.eye(3)
+        q_dot_arm = J_arm.T @ np.linalg.solve(A, v_lin)
 
-            # Adaptieve demping gebaseerd op manipuleerbaarheid w = sqrt(det(J*J^T))
-            w = np.sqrt(np.maximum(0.0, np.linalg.det(J @ J.T)))
-            damping = 0.02 if w > 0.05 else 0.02 + 0.1 * (1.0 - w / 0.05)
+        # 2. Polsgewrichten met de geverifieerde assenrichting
+        q_dot_wrist = np.array([-w_ang[0], -w_ang[1], w_ang[2]])
 
-            # Damped Least Squares
-            A = J @ J.T + (damping ** 2) * np.eye(6)
-            q_dot = J.T @ np.linalg.solve(A, twist_cmd)
+        q_dot = np.hstack([q_dot_arm, q_dot_wrist])
 
-            # Proportionele snelheidsbegrenzing
-            max_val = np.max(np.abs(q_dot))
-            if max_val > self.max_joint_vel:
-                q_dot = q_dot * (self.max_joint_vel / max_val)
+        # Begrens snelheden
+        max_val = np.max(np.abs(q_dot))
+        if max_val > self.max_joint_vel:
+            q_dot = q_dot * (self.max_joint_vel / max_val)
 
-            # Joint limit stop (voorkom doordraaien buiten [-2pi, 2pi])
-            for i in range(6):
-                if self.current_q[i] <= (self.q_min[i] + self.joint_buffer) and q_dot[i] < 0:
-                    q_dot[i] = 0.0
-                elif self.current_q[i] >= (self.q_max[i] - self.joint_buffer) and q_dot[i] > 0:
-                    q_dot[i] = 0.0
-
-            self.current_q += q_dot * self.dt
+        # Update gewrichten
+        self.current_q += q_dot * self.dt
 
         msg = JointState()
         msg.header.stamp = self.get_clock().now().to_msg()
@@ -113,14 +114,15 @@ class UR3eTaskSpaceController(Node):
 
 def main(args=None):
     rclpy.init(args=args)
-    node = UR3eTaskSpaceController()
+    node = UR3eDecoupled6DOFController()
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
         pass
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 if __name__ == '__main__':
     main()
