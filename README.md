@@ -1,7 +1,7 @@
-================================================================================
+
   UR3e 6-DOF TELEOPERATION WITH 3D SYSTEMS TOUCH (GEOMAGIC TOUCH / OMNI)
   Complete DIY Installation, Configuration & Run Guide
-================================================================================
+
 
 1. SYSTEM PREREQUISITES & OS DEPENDENCIES
 --------------------------------------------------------------------------------
