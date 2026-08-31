@@ -4,7 +4,7 @@ import numpy as np
 
 from sensor_msgs.msg import JointState
 from geometry_msgs.msg import TwistStamped
-from std_msgs.msg import Bool
+from std_msgs.msg import Bool, Float64MultiArray
 
 class UR3eDecoupled6DOFController(Node):
     def __init__(self):
@@ -23,20 +23,32 @@ class UR3eDecoupled6DOFController(Node):
         self.a = np.array([0.0, -0.24355, -0.2132, 0.0, 0.0, 0.0])
         self.alpha = np.array([np.pi/2, 0.0, 0.0, np.pi/2, -np.pi/2, 0.0])
 
-        # Vaste beginstand
-        self.home_q = np.array([0.0, -np.pi/2, np.pi/2, -np.pi/2, -np.pi/2, 0.0])
-        self.current_q = self.home_q.copy()
+        self.current_q = None
         self.target_twist = np.zeros(6)
 
         self.dt = 0.02
-        self.max_joint_vel = 1.5
+        self.max_joint_vel = 0.8  # Veilige limiet voor live fysieke tests
 
+        # Subscriptions
+        self.create_subscription(JointState, '/joint_states', self.joint_state_cb, 10)
         self.create_subscription(TwistStamped, '/target_twist', self.twist_cb, 10)
-        self.create_subscription(Bool, '/reset_home', self.reset_cb, 10)
-        self.joint_pub = self.create_publisher(JointState, '/joint_states', 10)
+        
+        # Publisher naar de fysieke UR velocity controller
+        self.cmd_pub = self.create_publisher(Float64MultiArray, '/forward_velocity_controller/commands', 10)
 
         self.timer = self.create_timer(self.dt, self.control_loop)
-        self.get_logger().info("UR3e 6-DOF Velocity Controller met Auto-Home actief!")
+        self.get_logger().info("UR3e Fysieke 6-DOF Real-Time Velocity Controller actief!")
+
+    def joint_state_cb(self, msg):
+        try:
+            # Sorteer binnenkomende joint hoeken op de juiste volgorde
+            q = [0.0] * 6
+            for idx, name in enumerate(self.joint_names):
+                i = msg.name.index(name)
+                q[idx] = msg.position[i]
+            self.current_q = np.array(q)
+        except (ValueError, IndexError):
+            pass
 
     def twist_cb(self, msg):
         self.target_twist = np.array([
@@ -47,11 +59,6 @@ class UR3eDecoupled6DOFController(Node):
             msg.twist.angular.y,
             msg.twist.angular.z
         ])
-
-    def reset_cb(self, msg):
-        if msg.data:
-            # Zachte overgang terug naar exacte homepositie
-            self.current_q += 0.15 * (self.home_q - self.current_q)
 
     def get_dh_matrix(self, theta, d, a, alpha):
         ct = np.cos(theta)
@@ -84,33 +91,32 @@ class UR3eDecoupled6DOFController(Node):
         return J_arm
 
     def control_loop(self):
+        if self.current_q is None:
+            return
+
         v_lin = self.target_twist[0:3]
         w_ang = self.target_twist[3:6]
 
-        # 1. Arm translatie
+        # DLS Jacobian voor armtranslatie
         J_arm = self.compute_arm_jacobian(self.current_q[0:3])
         damping = 0.02
         A = J_arm @ J_arm.T + (damping ** 2) * np.eye(3)
         q_dot_arm = J_arm.T @ np.linalg.solve(A, v_lin)
 
-        # 2. Polsgewrichten met de geverifieerde assenrichting
+        # Polsgewrichten
         q_dot_wrist = np.array([-w_ang[0], -w_ang[1], w_ang[2]])
 
         q_dot = np.hstack([q_dot_arm, q_dot_wrist])
 
-        # Begrens snelheden
+        # Snelheidsbegrenzing
         max_val = np.max(np.abs(q_dot))
         if max_val > self.max_joint_vel:
             q_dot = q_dot * (self.max_joint_vel / max_val)
 
-        # Update gewrichten
-        self.current_q += q_dot * self.dt
-
-        msg = JointState()
-        msg.header.stamp = self.get_clock().now().to_msg()
-        msg.name = self.joint_names
-        msg.position = self.current_q.tolist()
-        self.joint_pub.publish(msg)
+        # Publiceer snelheidscommando naar de motoren
+        cmd_msg = Float64MultiArray()
+        cmd_msg.data = q_dot.tolist()
+        self.cmd_pub.publish(cmd_msg)
 
 def main(args=None):
     rclpy.init(args=args)
