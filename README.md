@@ -1,6 +1,7 @@
-
+================================================================================
   UR3e 6-DOF TELEOPERATION WITH 3D SYSTEMS TOUCH (GEOMAGIC TOUCH / OMNI)
-  Complete DIY Installation, Configuration & Run Guide
+  Complete DIY Installation, Configuration & Run Guide (Real Robot Pipeline)
+================================================================================
 
 
 1. SYSTEM PREREQUISITES & OS DEPENDENCIES
@@ -9,10 +10,11 @@ Supported Environment:
 - OS: Ubuntu 22.04 LTS (Jammy Jellyfish)
 - ROS 2: Humble Hawksbill
 
-Install base system build tools and Python libraries:
+Install base system build tools, controller packages and Python libraries:
 $ sudo apt update
-$ sudo apt install -y git build-essential python3-pip python3-colcon-common-extensions
-$ pip3 install pynput numpy
+$ sudo apt install -y git build-essential python3-pip python3-colcon-common-extensions \
+                      ros-humble-ros2-control ros-humble-ros2-controllers
+$ pip3 install pynput numpy scipy
 
 
 2. 3D SYSTEMS TOUCH / OPENHAPTICS DRIVER SETUP
@@ -33,10 +35,23 @@ $ pip3 install pynput numpy
    $ Geomagic_Touch_Diagnostic
 
 
-3. ROS 2 UNIVERSAL ROBOTS PACKAGES
+3. ROS 2 UNIVERSAL ROBOTS HARDWARE DRIVER & NETWORK SETUP
 --------------------------------------------------------------------------------
-Install the official Universal Robots ROS 2 Humble packages:
-$ sudo apt install -y ros-humble-ur ros-humble-ur-moveit-config ros-humble-moveit
+1. Install the official Universal Robots ROS 2 driver:
+   $ sudo apt install -y ros-humble-ur ros-humble-ur-robot-driver
+
+2. Configure PC Static IP (Ethernet Settings):
+   - IP Address: 192.168.0.100
+   - Netmask:    255.255.255.0
+   - Gateway:    192.168.0.1
+
+3. Verify connection to UR3e robot:
+   $ ping 192.168.0.134
+
+4. On UR Teach Pendant:
+   - Go to: Installation -> URCaps -> External Control
+   - Set Host IP to: 192.168.0.100 (your laptop's IP)
+   - Load 'external_control.urp' and ensure safety mode is NORMAL
 
 
 4. WORKSPACE SETUP & BUILD
@@ -53,25 +68,37 @@ $ source ~/ros2_ws/install/setup.bash
 --------------------------------------------------------------------------------
 Open three separate terminals and source the workspace in each:
 
-TERMINAL 1 (MoveIt / RViz Mock Simulation):
+TERMINAL 1 (UR3e Real-Time Hardware Driver & Controller Manager):
 $ source ~/ros2_ws/install/setup.bash
-$ ros2 launch ur_moveit_config ur_moveit.launch.py ur_type:=ur3e use_mock_hardware:=true
+$ ros2 launch ur_robot_driver ur_control.launch.py \
+    ur_type:=ur3e \
+    robot_ip:=192.168.0.134 \
+    initial_joint_controller:=forward_velocity_controller \
+    launch_rviz:=true
+
+(Action on Teach Pendant: Press the Play button [▶] to start external control)
+
+* Note: If scaled_joint_trajectory_controller stays active, switch it once via:
+$ ros2 control switch_controllers --deactivate scaled_joint_trajectory_controller --activate forward_velocity_controller
 
 TERMINAL 2 (Real-Time 6-DOF Task-Space Controller):
 $ source ~/ros2_ws/install/setup.bash
 $ ros2 run ur3e_teleop_control task_space_controller
 
-TERMINAL 3 (Touch Haptic Driver):
+TERMINAL 3 (Touch Haptic Driver & Setpoint Publisher):
+Place stylus in the physical dock before running:
 $ source ~/ros2_ws/install/setup.bash
 $ ros2 run ur3e_teleop_control touch_publisher
 
 
-6. CONTROLS & SHORTCUTS
+6. CONTROLS & SHORTCUTS (Inside Terminal 3)
 --------------------------------------------------------------------------------
-- Stylus linear movement (X, Y, Z)     -> UR3e Arm translation (DLS Jacobian)
-- Stylus tilt / pitch (wrist 1)        -> UR3e Wrist 1 joint (pitch up/down)
-- Stylus swivel / yaw (wrist 2)        -> UR3e Wrist 2 joint (yaw left/right)
-- Stylus axial roll (wrist 3)          -> UR3e Wrist 3 joint (tool roll)
-- [SPACEBAR] (Hold)                    -> Clutch mode (disengages robot to reposition hand)
-- [r] key or Inkwell Docking           -> Automatic / manual drift-free reset to home pose
+- Stylus linear movement (X, Y, Z)  -> UR3e Cartesian translation (DLS Jacobian)
+- Stylus rotation (Pitch, Yaw, Roll)-> Flange orientation tracking (Lie Logarithm)
+- [SPACEBAR]                        -> Clutch toggle (pause/resume mapping to prevent jumps)
+- [e] key                           -> Engage orientation (aligns stylus with robot pose)
+- [c] key                           -> Close gripper (/gripper/cmd)
+- [o] key                           -> Open gripper (/gripper/cmd)
+- [r] key                           -> Reset / Re-zero setpoint relative to dock position
+- [Ctrl+C]                          -> Clean stop
 ================================================================================
