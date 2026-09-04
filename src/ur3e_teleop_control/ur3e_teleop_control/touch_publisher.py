@@ -1,10 +1,14 @@
 import rclpy
 from rclpy.node import Node
-from geometry_msgs.msg import TwistStamped
+from geometry_msgs.msg import PoseStamped
 from std_msgs.msg import Bool
 import ctypes
 import numpy as np
-from pynput import keyboard
+import sys
+import select
+import termios
+import tty
+import threading
 
 try:
     libhd = ctypes.CDLL("libHD.so")
@@ -13,122 +17,214 @@ except Exception:
 
 HD_CURRENT_POSITION = 0x2050
 HD_CURRENT_GIMBAL_ANGLES = 0x2150
+HD_CURRENT_BUTTONS = 0x2000
 
-class Touch6DOFPublisher(Node):
+class TouchPosePublisher(Node):
     def __init__(self):
         super().__init__('touch_publisher')
-        self.publisher_ = self.create_publisher(TwistStamped, '/target_twist', 10)
-        self.reset_pub_ = self.create_publisher(Bool, '/reset_home', 10)
-        
+        self.pose_pub = self.create_publisher(PoseStamped, '/target_pose', 10)
+        self.reset_pub = self.create_publisher(Bool, '/reset_home', 10)
+        self.engage_pub = self.create_publisher(Bool, '/engage_orientation', 10)
+        self.gripper_pub = self.create_publisher(Bool, '/gripper/cmd', 10)
+
         self.hHD = libhd.hdInitDevice(None)
         if self.hHD == 0xFFFFFFFF:
-            self.get_logger().error("Kon Touch niet initialiseren!")
+            self.get_logger().error("Kon Touch haptic device niet initialiseren!")
             return
 
         libhd.hdEnable(0x2200)
         libhd.hdStartScheduler()
 
         self.clutched = False
-        self.prev_pos = None
-        self.prev_angles = None
-        self.prev_time = self.get_clock().now()
-
-        # Kalibratie
-        self.scale_lin = 1.5
-        self.scale_ang = 1.8
-
         self.dock_pos = None
         self.dock_ang = None
+        
+        self.clutch_offset_pos = np.zeros(3)
+        self.clutch_offset_ang = np.zeros(3)
+        self.clutch_start_pos = None
+        self.clutch_start_ang = None
 
-        self.listener = keyboard.Listener(
-            on_press=self.on_press,
-            on_release=self.on_release)
-        self.listener.start()
+        self.scale_pos = 1.3
+        self.prev_btn_state = 0
+        self.running = True
+        self.engaged = False
 
-        self.timer = self.create_timer(0.02, self.publish_twist) # 50 Hz
-        self.get_logger().info("Touch 6-DOF Driver actief! [Spatie = Clutch | 'r' = Reset]")
+        # Terminal keyboard thread
+        self.orig_settings = termios.tcgetattr(sys.stdin)
+        self.key_thread = threading.Thread(target=self.keyboard_loop, daemon=True)
+        self.key_thread.start()
 
-    def on_press(self, key):
-        if key == keyboard.Key.space:
-            self.clutched = True
+        self.timer = self.create_timer(0.02, self.publish_pose) # 50 Hz
+        
+        print("\n=======================================================")
+        print("  TOUCH TELEOP BEDIENING MET ALIGNMENT")
+        print("  [e]      : ENGAGE ORIENTATION (Lijn pen en gripper uit)")
+        print("  [c]      : Sluit gripper (CLOSE)")
+        print("  [o]      : Open gripper (OPEN)")
+        print("  [r]      : Reset robot naar 90-graden rustpositie")
+        print("  [SPATIE] : Clutch (pauzeer sturing om pen te verplaatsen)")
+        print("  [Ctrl+C] : Stoppen")
+        print("=======================================================\n")
+
+    def keyboard_loop(self):
+        tty.setcbreak(sys.stdin.fileno())
         try:
-            if key.char == 'r':
-                msg = Bool()
-                msg.data = True
-                self.reset_pub_.publish(msg)
-                self.get_logger().info("Handmatige reset naar beginstand verstuurd!")
-        except AttributeError:
-            pass
+            while self.running and rclpy.ok():
+                rlist, _, _ = select.select([sys.stdin], [], [], 0.1)
+                if rlist:
+                    key = sys.stdin.read(1)
+                    if key == 'e':
+                        self.engage_alignment()
+                    elif key == 'c':
+                        msg = Bool()
+                        msg.data = True
+                        self.gripper_pub.publish(msg)
+                        self.get_logger().info(">>> Knop 'c': GRIPPER SLUITEN <<<")
+                    elif key == 'o':
+                        msg = Bool()
+                        msg.data = False
+                        self.gripper_pub.publish(msg)
+                        self.get_logger().info(">>> Knop 'o': GRIPPER OPENEN <<<")
+                    elif key == 'r':
+                        self.reset_reference()
+                    elif key == ' ':
+                        self.toggle_clutch()
+                    elif key == '\x03': # Ctrl+C
+                        break
+        finally:
+            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, self.orig_settings)
 
-    def on_release(self, key):
-        if key == keyboard.Key.space:
-            self.clutched = False
-            self.prev_pos = None
-            self.prev_angles = None
-
-    def publish_twist(self):
+    def engage_alignment(self):
         libhd.hdBeginFrame(self.hHD)
-        
-        pos = (ctypes.c_double * 3)()
-        libhd.hdGetDoublev(HD_CURRENT_POSITION, pos)
-        
         gimbal = (ctypes.c_double * 3)()
         libhd.hdGetDoublev(HD_CURRENT_GIMBAL_ANGLES, gimbal)
-        
         libhd.hdEndFrame(self.hHD)
 
-        curr_time = self.get_clock().now()
-        dt = (curr_time - self.prev_time).nanoseconds / 1e9
+        curr_ang = np.array([gimbal[1], gimbal[0], gimbal[2]])
+        self.dock_ang = curr_ang.copy()
+        self.clutch_offset_ang = np.zeros(3)
+        self.engaged = True
 
-        curr_pos = np.array([-pos[2] / 1000.0, -pos[0] / 1000.0, pos[1] / 1000.0])
+        msg = Bool()
+        msg.data = True
+        self.engage_pub.publish(msg)
+        self.get_logger().info(">>> [ENGAGED] Pen & Gripper oriëntatie nu 1-op-1 uitgelijnd! <<<")
+
+    def reset_reference(self):
+        libhd.hdBeginFrame(self.hHD)
+        pos = (ctypes.c_double * 3)()
+        libhd.hdGetDoublev(HD_CURRENT_POSITION, pos)
+        gimbal = (ctypes.c_double * 3)()
+        libhd.hdGetDoublev(HD_CURRENT_GIMBAL_ANGLES, gimbal)
+        libhd.hdEndFrame(self.hHD)
+
+        self.dock_pos = np.array([pos[2] / 1000.0, pos[0] / 1000.0, pos[1] / 1000.0])
+        self.dock_ang = np.array([gimbal[1], gimbal[0], gimbal[2]])
+        self.clutch_offset_pos = np.zeros(3)
+        self.clutch_offset_ang = np.zeros(3)
+        self.engaged = False
+
+        msg = Bool()
+        msg.data = True
+        self.reset_pub.publish(msg)
+        self.get_logger().info(">>> Knop 'r': Robot terug naar 90-graden rustpositie. <<<")
+
+    def toggle_clutch(self):
+        self.clutched = not self.clutched
+        if self.clutched:
+            libhd.hdBeginFrame(self.hHD)
+            pos = (ctypes.c_double * 3)()
+            libhd.hdGetDoublev(HD_CURRENT_POSITION, pos)
+            gimbal = (ctypes.c_double * 3)()
+            libhd.hdGetDoublev(HD_CURRENT_GIMBAL_ANGLES, gimbal)
+            libhd.hdEndFrame(self.hHD)
+            self.clutch_start_pos = np.array([pos[2] / 1000.0, pos[0] / 1000.0, pos[1] / 1000.0])
+            self.clutch_start_ang = np.array([gimbal[1], gimbal[0], gimbal[2]])
+            self.get_logger().info(">>> CLUTCH ACTIEF (Robot gepauzeerd) <<<")
+        else:
+            if self.clutch_start_pos is not None:
+                libhd.hdBeginFrame(self.hHD)
+                pos = (ctypes.c_double * 3)()
+                libhd.hdGetDoublev(HD_CURRENT_POSITION, pos)
+                gimbal = (ctypes.c_double * 3)()
+                libhd.hdGetDoublev(HD_CURRENT_GIMBAL_ANGLES, gimbal)
+                libhd.hdEndFrame(self.hHD)
+                curr_pos = np.array([pos[2] / 1000.0, pos[0] / 1000.0, pos[1] / 1000.0])
+                curr_ang = np.array([gimbal[1], gimbal[0], gimbal[2]])
+                self.clutch_offset_pos += (curr_pos - self.clutch_start_pos)
+                self.clutch_offset_ang += (curr_ang - self.clutch_start_ang)
+            self.get_logger().info(">>> CLUTCH VRIJGEGEVEN (Sturing hervat) <<<")
+
+    def publish_pose(self):
+        libhd.hdBeginFrame(self.hHD)
+        pos = (ctypes.c_double * 3)()
+        libhd.hdGetDoublev(HD_CURRENT_POSITION, pos)
+        gimbal = (ctypes.c_double * 3)()
+        libhd.hdGetDoublev(HD_CURRENT_GIMBAL_ANGLES, gimbal)
+        buttons = ctypes.c_int()
+        libhd.hdGetIntegerv(HD_CURRENT_BUTTONS, ctypes.byref(buttons))
+        libhd.hdEndFrame(self.hHD)
+
+        # Knoppen op Touch pen: Knop 1 = Sluit, Knop 2 = Open
+        btn_val = buttons.value
+        if (btn_val & 1) and not (self.prev_btn_state & 1):
+            msg = Bool()
+            msg.data = True
+            self.gripper_pub.publish(msg)
+            self.get_logger().info(">>> Stylus Knop 1: GRIPPER SLUITEN <<<")
+        elif (btn_val & 2) and not (self.prev_btn_state & 2):
+            msg = Bool()
+            msg.data = False
+            self.gripper_pub.publish(msg)
+            self.get_logger().info(">>> Stylus Knop 2: GRIPPER OPENEN <<<")
+        self.prev_btn_state = btn_val
+
+        curr_pos = np.array([pos[2] / 1000.0, pos[0] / 1000.0, pos[1] / 1000.0])
         curr_ang = np.array([gimbal[1], gimbal[0], gimbal[2]])
 
-        # Inktpot nulpunt vastleggen bij start
         if self.dock_pos is None:
             self.dock_pos = curr_pos.copy()
             self.dock_ang = curr_ang.copy()
 
-        # Automatische detectie: pen terug in inktpot (< 5 mm en < 0.05 rad)
-        dist_to_dock = np.linalg.norm(curr_pos - self.dock_pos)
-        ang_to_dock = np.linalg.norm(curr_ang - self.dock_ang)
-        if dist_to_dock < 0.005 and ang_to_dock < 0.05:
-            reset_msg = Bool()
-            reset_msg.data = True
-            self.reset_pub_.publish(reset_msg)
+        if self.clutched:
+            return
 
-        msg = TwistStamped()
-        msg.header.stamp = curr_time.to_msg()
+        effective_pos = curr_pos - self.clutch_offset_pos
+        effective_ang = curr_ang - self.clutch_offset_ang
+
+        delta_pos = (effective_pos - self.dock_pos) * self.scale_pos
+        
+        # Alleen delta_ang doorgeven als we engaged zijn, anders blijft pols netjes in rust
+        if self.engaged:
+            delta_ang = effective_ang - self.dock_ang
+        else:
+            delta_ang = np.zeros(3)
+
+        msg = PoseStamped()
+        msg.header.stamp = self.get_clock().now().to_msg()
         msg.header.frame_id = "base_link"
 
-        if not self.clutched and self.prev_pos is not None and self.prev_angles is not None and dt > 0.001:
-            v_lin = (curr_pos - self.prev_pos) / dt * self.scale_lin
-            v_lin = np.clip(v_lin, -0.35, 0.35)
+        msg.pose.position.x = float(delta_pos[0])
+        msg.pose.position.y = float(delta_pos[1])
+        msg.pose.position.z = float(delta_pos[2])
 
-            w_ang = (curr_ang - self.prev_angles) / dt * self.scale_ang
-            w_ang = np.clip(w_ang, -1.5, 1.5)
+        msg.pose.orientation.x = float(delta_ang[0])
+        msg.pose.orientation.y = float(delta_ang[1])
+        msg.pose.orientation.z = float(delta_ang[2])
+        msg.pose.orientation.w = 1.0
 
-            msg.twist.linear.x = float(v_lin[0])
-            msg.twist.linear.y = float(v_lin[1])
-            msg.twist.linear.z = float(v_lin[2])
-
-            msg.twist.angular.x = float(w_ang[0])
-            msg.twist.angular.y = float(w_ang[1])
-            msg.twist.angular.z = float(w_ang[2])
-
-        self.publisher_.publish(msg)
-        self.prev_pos = curr_pos
-        self.prev_angles = curr_ang
-        self.prev_time = curr_time
+        self.pose_pub.publish(msg)
 
     def destroy_node(self):
-        self.listener.stop()
+        self.running = False
+        termios.tcsetattr(sys.stdin, termios.TCSADRAIN, self.orig_settings)
         libhd.hdStopScheduler()
         libhd.hdDisableDevice(self.hHD)
         super().destroy_node()
 
 def main(args=None):
     rclpy.init(args=args)
-    node = Touch6DOFPublisher()
+    node = TouchPosePublisher()
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
