@@ -79,11 +79,20 @@ class TouchPosePublisher(Node):
                 self.get_logger().info('>>> Nulpunt vergrendeld <<<')
             return
         self.publish_haptic_force()
+        if not self.engaged:
+            # Robot blijft gegarandeerd stil tot er op 'e' gedrukt wordt
+            out_msg = PoseStamped()
+            out_msg.header.stamp = self.get_clock().now().to_msg()
+            out_msg.header.frame_id = 'base_link'
+            out_msg.pose.orientation.w = 1.0
+            self.pose_pub.publish(out_msg)
+            return
+
         if self.clutched: return
         effective_pos = curr_pos - self.clutch_offset_pos
         effective_ang = curr_ang - self.clutch_offset_ang
         delta_pos = (effective_pos - self.dock_pos) * self.scale_pos
-        delta_ang = (effective_ang - self.dock_ang) if self.engaged else np.zeros(3)
+        delta_ang = effective_ang - self.dock_ang
         out_msg = PoseStamped()
         out_msg.header.stamp = self.get_clock().now().to_msg()
         out_msg.header.frame_id = 'base_link'
@@ -145,8 +154,10 @@ class TouchPosePublisher(Node):
                 if rlist:
                     key = sys.stdin.read(1)
                     if key == 'e':
-                        if self.raw_ang is not None:
+                        if self.raw_pos is not None and self.raw_ang is not None:
+                            self.dock_pos = self.raw_pos.copy()
                             self.dock_ang = self.raw_ang.copy()
+                            self.clutch_offset_pos = np.zeros(3)
                             self.clutch_offset_ang = np.zeros(3)
                             self.engaged = True
                             self.wrench_bias = self.raw_wrench_force.copy()
