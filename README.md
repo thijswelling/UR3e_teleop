@@ -1,63 +1,63 @@
-# UR3e Haptic Teleoperation met 3D Systems Touch (ROS 2)
+# UR3e Haptic Teleoperation with 3D Systems Touch (ROS 2)
 
-Complete bilaterale teleoperatie-pipeline voor een Universal Robots UR3e met force feedback via een 3D Systems Touch haptic device in ROS 2 Humble.
+Complete bilateral teleoperation pipeline for a Universal Robots UR3e with force feedback via a 3D Systems Touch haptic device in ROS 2 Humble.
 
 ---
 
-## Systeemarchitectuur
+## System Architecture
 
 1. **Hardware Bridge (`touch_haptics/touch_haptic_bridge` - C++)**:
-   - Draait op een asynchrone 1000 Hz OpenHaptics scheduler loop voor stabiele krachtsturing.
-   - Bevat een startup hardware-interlock om te voorkomen dat nullen worden gepubliceerd voor de driver actief is.
+   - Runs an asynchronous 1000 Hz OpenHaptics scheduler loop for stable haptic force rendering.
+   - Includes a startup hardware interlock to prevent streaming zero-vectors before device initialisation.
    - Topics: `/touch/raw_pose` (20 Hz), `/touch/buttons` (20 Hz), `/touch/cmd_force` (in).
 
 2. **Teleop Publisher (`ur3e_teleop_control/touch_publisher` - Python)**:
-   - Verwerkt hardware-offsets, clutching, filtering en scaling.
-   - Roteert F/T-metingen via voorwaartse kinematica (DH-parameters) van het gripper-frame naar het `base_link` robotframe.
-   - Haptische mapping met dode band (2.2 N), EWMA-smoothing en actieve tegendruk op de Touch assen.
-   - Topics: `/target_pose` (uit), `/gripper/cmd` (uit), `/touch/cmd_force` (uit).
+   - Handles stylus offsets, clutching, deadbands, filtering, and workspace scaling.
+   - Transforms tool-flange F/T sensor wrenches into the robot's `base_link` frame using forward kinematics (DH parameters).
+   - Haptic force mapping features a 2.2 N deadband, EWMA smoothing, and counter-force rendering along the Touch axes.
+   - Topics: `/target_pose` (out), `/gripper/cmd` (out), `/touch/cmd_force` (out).
 
 3. **Task-Space Controller (`ur3e_teleop_control/task_space_controller` - Python)**:
-   - Closed-loop DLS (Damped Least Squares) Jacobiaan inversiekinematica.
-   - Bevat opstartvergrendeling: stuurt nulsnelheden totdat de eerste geldige target pose binnen is.
-   - Null-space postural projectie naar de ruststand.
+   - Closed-loop DLS (Damped Least Squares) Jacobian inverse kinematics.
+   - Startup interlock: commands zero velocity until a valid target pose is received.
+   - Postural null-space projection towards the home configuration.
    - Topic: `/forward_velocity_controller/commands`.
 
 ---
 
-## Opstartvolgorde (Stappenplan)
+## Startup Sequence (Step-by-Step)
 
-Gebruik 5 afzonderlijke terminals met telkens `source ~/ros2_ws/install/setup.bash`:
+Open 5 separate terminals and run `source ~/ros2_ws/install/setup.bash` in each:
 
-### Terminal 1: Robot Driver & Forward Velocity Controller
-Start de UR-driver en zorg dat de forward velocity controller actief is:
+### Terminal 1: Robot Driver & Velocity Controller
+Launch the official UR driver with the forward velocity controller configured:
 ros2 launch ur_robot_driver ur_control.launch.py ur_type:=ur3e robot_ip:=<ROBOT_IP> launch_rviz:=false initial_joint_controller:=forward_velocity_controller
 
-### Terminal 2: Robotiq 2F Gripper Driver (optioneel)
+### Terminal 2: Robotiq 2F Gripper Driver (Optional)
 ros2 run robotiq_2f_driver gripper_node
 
 ### Terminal 3: Task Space Controller
-Start de gesloten-lus kinematica controller (deze blijft stilstaan tot doelen binnenkomen):
+Start the closed-loop kinematics controller (remains stationary until commands arrive):
 source ~/ros2_ws/install/setup.bash
 ros2 run ur3e_teleop_control task_space_controller
 
 ### Terminal 4: C++ Haptic Bridge (1000 Hz)
-Initialiseer de Touch interface:
+Initialise the Touch hardware interface:
 source ~/ros2_ws/install/setup.bash
 ros2 run touch_haptics touch_haptic_bridge
 
 ### Terminal 5: Touch Publisher & Input Manager
-Start de invoerbehandeling en force mapping:
+Start teleoperation mapping, clutching, and force-feedback processing:
 source ~/ros2_ws/install/setup.bash
 ros2 run ur3e_teleop_control touch_publisher
 
 ---
 
-## Besturing & Toetsen (in Terminal 5)
+## Controls & Keybindings (Active in Terminal 5)
 
-- [e]      : Engage & Tare (Vergrendelt nulstand, activeert pols-oriëntatiesturing en tareert F/T sensor)
-- [SPATIE] : Clutch (Pauzeert robotbeweging; verplaats de stylus zonder de robot mee te nemen)
-- [c]      : Sluit gripper (of Stylus Knop 1)
-- [o]      : Open gripper (of Stylus Knop 2)
-- [r]      : Reset Home (Brengt doelreferentie terug naar de fysieke startpositie)
-- [Ctrl+C] : Stop teleoperatie veilig
+- [e]       : Engage & Tare (Locks origin, activates wrist orientation tracking, and tares F/T sensor)
+- [SPACE]   : Clutch toggle (Freezes robot pose; allows repositioning stylus within workspace)
+- [c]       : Close gripper (or Stylus Button 1)
+- [o]       : Open gripper (or Stylus Button 2)
+- [r]       : Reset Home (Returns target reference to home position)
+- [Ctrl+C]  : Safe shutdown
