@@ -24,6 +24,7 @@ setup(
     entry_points={
         'console_scripts': [
             'task_space_controller = ur3e_teleop_control.task_space_controller:main',
+            'robotiq_bridge = ur3e_teleop_control.robotiq_bridge:main',
             'touch_publisher = ur3e_teleop_control.touch_publisher:main',
             'keyboard_teleop = ur3e_teleop_control.keyboard_teleop:main',
         ],

@@ -142,7 +142,7 @@ class TouchPosePublisher(Node):
                 target_force = f_cmd
         self.filtered_force = 0.3 * target_force + 0.7 * self.filtered_force
         f_msg.wrench.force.x = -float(self.filtered_force[1])
-        f_msg.wrench.force.y =  float(self.filtered_force[2])
+        f_msg.wrench.force.y = -float(self.filtered_force[2])
         f_msg.wrench.force.z = -float(self.filtered_force[0])
         self.cmd_force_pub.publish(f_msg)
 
