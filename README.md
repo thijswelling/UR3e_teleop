@@ -35,7 +35,7 @@ Complete bilateral teleoperation pipeline for a Universal Robots UR3e and Roboti
 
 Execute the startup script from the workspace root (pass your robot IP as an argument):
 
-./start_teleop.sh <ROBOT_IP>
+./start_teleop.sh <ROBOT_IP>     # <- change "<Robot_IP" to 192.168.0.134 (On teach pendant, find/change in Settings-Network-IP address)
 
 Press `Ctrl+C` in this terminal to terminate all nodes and processes cleanly.
 
