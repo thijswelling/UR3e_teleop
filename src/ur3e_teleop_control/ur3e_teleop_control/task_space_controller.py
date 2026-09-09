@@ -32,14 +32,15 @@ class UR3eClosedLoopPoseController(Node):
         self.target_delta_rot = np.zeros(3)
         self.filtered_delta_pos = np.zeros(3)
         self.filtered_delta_rot = np.zeros(3)
+        self.prev_target_pos = None
 
         self.has_received_target = False
 
         self.dt = 0.02
-        self.Kp_pos = 3.0
-        self.Kp_wrist = 3.5
-        self.K_posture = 1.0
-        self.max_joint_vel = 0.55
+        self.Kp_pos = 6.5
+        self.Kp_wrist = 10.0
+        self.K_posture = 0.0
+        self.max_joint_vel = 2.2
 
         self.create_subscription(JointState, "/joint_states", self.joint_state_cb, 10)
         self.create_subscription(PoseStamped, "/target_pose", self.pose_cb, 10)
@@ -48,7 +49,7 @@ class UR3eClosedLoopPoseController(Node):
         self.cmd_pub = self.create_publisher(Float64MultiArray, "/forward_velocity_controller/commands", 10)
 
         self.timer = self.create_timer(self.dt, self.control_loop)
-        self.get_logger().info("UR3e Pose Tracking Controller actief met Startup Interlock!")
+        self.get_logger().info("UR3e Pose Tracking Controller actief (Optie 2: Zonder compensatie)!")
 
     def joint_state_cb(self, msg):
         try:
@@ -71,7 +72,7 @@ class UR3eClosedLoopPoseController(Node):
             msg.pose.position.x,
             msg.pose.position.y,
             msg.pose.position.z
-        ]), -0.20, 0.20)
+        ]), -0.25, 0.25)
 
         raw_rot = np.clip(np.array([
             msg.pose.orientation.x,
@@ -98,6 +99,7 @@ class UR3eClosedLoopPoseController(Node):
             self.target_delta_rot = np.zeros(3)
             self.filtered_delta_pos = np.zeros(3)
             self.filtered_delta_rot = np.zeros(3)
+            self.prev_target_pos = None
             if self.home_q is not None:
                 self.engaged_wrist_q = self.home_q[3:6].copy()
             self.get_logger().info("Doelpositie teruggezet naar Home.")
@@ -147,16 +149,35 @@ class UR3eClosedLoopPoseController(Node):
             self.cmd_pub.publish(cmd_msg)
             return
 
-        self.filtered_delta_pos = 0.2 * self.target_delta_pos + 0.8 * self.filtered_delta_pos
-        self.filtered_delta_rot = 0.2 * self.target_delta_rot + 0.8 * self.filtered_delta_rot
+        self.filtered_delta_pos = 0.85 * self.target_delta_pos + 0.15 * self.filtered_delta_pos
+        self.filtered_delta_rot = self.target_delta_rot.copy()
 
         curr_pos = self.forward_kinematics_wrist(self.current_q[0:3])
         target_pos = self.home_pos + self.filtered_delta_pos
+
+        shoulder_pos = np.array([0.0, 0.0, self.d[0]])
+        vec_from_shoulder = target_pos - shoulder_pos
+        dist_from_shoulder = np.linalg.norm(vec_from_shoulder)
+
+        max_reach = 0.415
+        if dist_from_shoulder > max_reach:
+            target_pos = shoulder_pos + vec_from_shoulder * (max_reach / dist_from_shoulder)
+
         pos_error = target_pos - curr_pos
-        v_lin = self.Kp_pos * pos_error
+        
+        if self.prev_target_pos is not None:
+            v_ff = (target_pos - self.prev_target_pos) / self.dt
+            v_ff_norm = np.linalg.norm(v_ff)
+            if v_ff_norm > 1.10:
+                v_ff = (v_ff / v_ff_norm) * 1.10
+        else:
+            v_ff = np.zeros(3)
+        self.prev_target_pos = target_pos.copy()
+
+        v_lin = 0.40 * v_ff + self.Kp_pos * pos_error
 
         J_arm = self.compute_arm_jacobian(self.current_q[0:3])
-        damping = 0.04
+        damping = 0.015
         A = J_arm @ J_arm.T + (damping ** 2) * np.eye(3)
         J_dls = J_arm.T @ np.linalg.inv(A)
 
@@ -164,6 +185,7 @@ class UR3eClosedLoopPoseController(Node):
         N = np.eye(3) - (J_dls @ J_arm)
         q_dot_arm = (J_dls @ v_lin) + (N @ q_null)
 
+        # Directe 1-op-1 sturing zonder automatische pitch compensatie
         ref_wrist = self.engaged_wrist_q if self.engaged_wrist_q is not None else self.home_q[3:6]
         target_wrist_q = ref_wrist + np.array([
             -self.filtered_delta_rot[0],
@@ -175,9 +197,13 @@ class UR3eClosedLoopPoseController(Node):
 
         q_dot = np.hstack([q_dot_arm, q_dot_wrist])
 
-        max_val = np.max(np.abs(q_dot))
-        if max_val > self.max_joint_vel:
-            q_dot = q_dot * (self.max_joint_vel / max_val)
+        max_arm = np.max(np.abs(q_dot[0:3]))
+        if max_arm > 2.8:
+            q_dot[0:3] = q_dot[0:3] * (2.8 / max_arm)
+
+        max_wrist = np.max(np.abs(q_dot[3:6]))
+        if max_wrist > 3.0:
+            q_dot[3:6] = q_dot[3:6] * (3.0 / max_wrist)
 
         if np.linalg.norm(pos_error) < 0.002 and np.linalg.norm(wrist_error) < 0.01:
             q_dot = np.zeros(6)
