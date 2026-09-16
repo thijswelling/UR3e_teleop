@@ -24,6 +24,15 @@ class TouchPosePublisher(Node):
         self.a = np.array([0.0, -0.24355, -0.2132, 0.0, 0.0, 0.0])
         self.alpha = np.array([np.pi/2, 0.0, 0.0, np.pi/2, -np.pi/2, 0.0])
         self.R_base_tool = np.eye(3)
+        
+        # --- ZWAARTEKRACHT INSTELLINGEN ---
+        self.gripper_weight = 9.81  # Ongeveer 1kg voor de Hand-E grijper in Newton
+        self.tare_external_force = np.zeros(3)
+        self.is_tared = False
+        self.tare_samples = []
+        self.net_external_force = np.zeros(3)
+        # ----------------------------------
+
         self.clutched = False
         self.dock_pos = None
         self.dock_ang = None
@@ -41,8 +50,7 @@ class TouchPosePublisher(Node):
         self.is_initialized = False
         self.raw_wrench_force = np.zeros(3)
         self.filtered_force = np.zeros(3)
-        self.wrench_bias = None
-        self.tare_samples = []
+        
         self.orig_settings = termios.tcgetattr(sys.stdin)
         self.key_thread = threading.Thread(target=self.keyboard_loop, daemon=True)
         self.key_thread.start()
@@ -80,7 +88,6 @@ class TouchPosePublisher(Node):
             return
         self.publish_haptic_force()
         if not self.engaged:
-            # Robot blijft gegarandeerd stil tot er op 'e' gedrukt wordt
             out_msg = PoseStamped()
             out_msg.header.stamp = self.get_clock().now().to_msg()
             out_msg.header.frame_id = 'base_link'
@@ -108,38 +115,46 @@ class TouchPosePublisher(Node):
     def button_cb(self, msg):
         btn_val = msg.data
         if (btn_val & 1) and not (self.prev_btn_state & 1):
-            cmd = Bool(data=True)
-            self.gripper_pub.publish(cmd)
+            self.gripper_pub.publish(Bool(data=True))
         elif (btn_val & 2) and not (self.prev_btn_state & 2):
-            cmd = Bool(data=False)
-            self.gripper_pub.publish(cmd)
+            self.gripper_pub.publish(Bool(data=False))
         self.prev_btn_state = btn_val
 
     def wrench_cb(self, msg):
-        sample = np.array([msg.wrench.force.x, msg.wrench.force.y, msg.wrench.force.z])
-        self.raw_wrench_force = 0.25 * sample + 0.75 * self.raw_wrench_force
-        if self.wrench_bias is None:
-            self.tare_samples.append(sample)
-            if len(self.tare_samples) >= 30:
-                self.wrench_bias = np.mean(self.tare_samples, axis=0)
-                self.get_logger().info(f'>>> Bias Getareerd: {np.round(self.wrench_bias, 2)} N <<<')
+            sample = np.array([msg.wrench.force.x, msg.wrench.force.y, msg.wrench.force.z])
+            
+            # Zeer sterk low-pass filter tegen de laatste meet-ruis (15% nieuw, 85% oud)
+            self.raw_wrench_force = 0.15 * sample + 0.85 * self.raw_wrench_force
+            
+            if not self.is_tared:
+                self.tare_samples.append(self.raw_wrench_force)
+                if len(self.tare_samples) >= 30:
+                    self.tare_external_force = np.mean(self.tare_samples, axis=0)
+                    self.is_tared = True
+                    self.get_logger().info(f'>>> Sensor nulmeting voltooid <<<')
+
+            self.net_external_force = self.raw_wrench_force - self.tare_external_force
 
     def publish_haptic_force(self):
         f_msg = WrenchStamped()
         f_msg.header.stamp = self.get_clock().now().to_msg()
         f_msg.header.frame_id = 'touch'
         target_force = np.zeros(3)
-        if self.wrench_bias is not None and self.engaged:
-            net_sensor = self.raw_wrench_force - self.wrench_bias
-            net_force = self.R_base_tool @ net_sensor
-            mag = np.linalg.norm(net_force)
-            deadband = 2.2
+        
+        if self.is_tared and self.engaged:
+            # Draai de gecompenseerde kracht terug naar de basis (zodat je pen de juiste kant op trekt)
+            net_force_base = self.R_base_tool @ self.net_external_force
+            mag = np.linalg.norm(net_force_base)
+            
+            # We kunnen de deadband nu lager zetten omdat zwaartekrachtruis weg is!
+            deadband = 1.2 
             if mag > deadband:
                 eff = mag - deadband
-                f_cmd = -(net_force / mag) * (eff * 0.16)
+                f_cmd = -(net_force_base / mag) * (eff * 0.16)
                 f_mag = np.linalg.norm(f_cmd)
                 if f_mag > 2.5: f_cmd = (f_cmd / f_mag) * 2.5
                 target_force = f_cmd
+                
         self.filtered_force = 0.3 * target_force + 0.7 * self.filtered_force
         f_msg.wrench.force.x = -float(self.filtered_force[1])
         f_msg.wrench.force.y = -float(self.filtered_force[2])
@@ -160,21 +175,31 @@ class TouchPosePublisher(Node):
                             self.clutch_offset_pos = np.zeros(3)
                             self.clutch_offset_ang = np.zeros(3)
                             self.engaged = True
-                            self.wrench_bias = self.raw_wrench_force.copy()
+                            
+                            # HERTAREREN VAN DE SENSOR
+                            self.is_tared = False
+                            self.tare_samples = []
+                            
                             self.filtered_force = np.zeros(3)
                             self.engage_pub.publish(Bool(data=True))
-                            self.get_logger().info('>>> [ENGAGED] Nulpunt gezet! <<<')
+                            self.get_logger().info('>>> [ENGAGED] Nulpunt & F/T sensor gereset! <<<')
                     elif key == 'c': self.gripper_pub.publish(Bool(data=True))
                     elif key == 'o': self.gripper_pub.publish(Bool(data=False))
                     elif key == 'r':
-                        if self.raw_pos is not None:
-                            self.dock_pos = self.raw_pos.copy()
-                            self.dock_ang = self.raw_ang.copy()
-                            self.clutch_offset_pos = np.zeros(3)
-                            self.clutch_offset_ang = np.zeros(3)
-                            self.engaged = False
-                            self.filtered_force = np.zeros(3)
-                            self.reset_pub.publish(Bool(data=True))
+                            if self.raw_pos is not None and self.engaged:
+                                self.dock_pos = self.raw_pos.copy()
+                                self.dock_ang = self.raw_ang.copy()
+                                self.clutch_offset_pos = np.zeros(3)
+                                self.clutch_offset_ang = np.zeros(3)
+                                
+                                # FIX DE SPRONG: Als de pen op pauze (clutch) staat tijdens [r], 
+                                # reset dan ook de pauze-startpositie naar het huidige punt!
+                                if self.clutched:
+                                    self.clutch_start_pos = self.raw_pos.copy()
+                                    self.clutch_start_ang = self.raw_ang.copy()
+                                    
+                                self.filtered_force = np.zeros(3)
+                                self.reset_pub.publish(Bool(data=True))
                     elif key == ' ':
                         self.clutched = not self.clutched
                         if self.clutched and self.raw_pos is not None:
