@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
@@ -12,31 +13,37 @@ class TouchPosePublisher(Node):
     def __init__(self):
         super().__init__('touch_publisher')
         
+        # ROS 2 Publishers for sending target poses, reset signals, engage states, gripper commands, and haptic force feedback
         self.pose_pub = self.create_publisher(PoseStamped, '/target_pose', 10)
         self.reset_pub = self.create_publisher(Bool, '/reset_home', 10)
         self.engage_pub = self.create_publisher(Bool, '/engage_orientation', 10)
         self.gripper_pub = self.create_publisher(Bool, '/gripper/cmd', 10)
         self.cmd_force_pub = self.create_publisher(WrenchStamped, '/touch/cmd_force', 10)
         
+        # Subscriptions to receive raw haptic data, button states, robot joint states, and force/torque sensor data
         self.raw_pose_sub = self.create_subscription(PoseStamped, '/touch/raw_pose', self.raw_pose_cb, 10)
         self.btn_sub = self.create_subscription(Int32, '/touch/buttons', self.button_cb, 10)
         self.joint_sub = self.create_subscription(JointState, '/joint_states', self.joint_cb, 10)
         self.wrench_sub = self.create_subscription(WrenchStamped, '/force_torque_sensor_broadcaster/wrench', self.wrench_cb, qos_profile_sensor_data)
 
+        # UR3e Denavit-Hartenberg parameters
         self.d = np.array([0.15185, 0.0, 0.0, 0.13105, 0.08535, 0.0921])
         self.a = np.array([0.0, -0.24355, -0.2132, 0.0, 0.0, 0.0])
         self.alpha = np.array([np.pi/2, 0.0, 0.0, np.pi/2, -np.pi/2, 0.0])
         self.R_base_tool = np.eye(3)
         
+        # Force/Torque sensor zero-calibration variables
         self.tare_external_force = np.zeros(3)
         self.is_tared = False
         self.tare_samples = []
         self.net_external_force = np.zeros(3)
 
+        # Teleoperation state management variables
         self.clutched = False
         self.dock_pos = None
         self.dock_rot = None
         
+        # Clutch offsets to prevent accumulation and drift during engagement
         self.clutch_offset_pos = np.zeros(3)
         self.clutch_offset_rot = R.identity()
         self.clutch_start_pos = None
@@ -54,16 +61,19 @@ class TouchPosePublisher(Node):
         self.raw_wrench_force = np.zeros(3)
         self.filtered_force = np.zeros(3)
         
+        # Setup non-blocking terminal keyboard listener for operator shortcuts
         self.orig_settings = termios.tcgetattr(sys.stdin)
         self.key_thread = threading.Thread(target=self.keyboard_loop, daemon=True)
         self.key_thread.start()
 
     def get_dh_matrix(self, theta, d, a, alpha):
+        # Calculate standard DH transformation matrix
         ct, st = np.cos(theta), np.sin(theta)
         ca, sa = np.cos(alpha), np.sin(alpha)
         return np.array([[ct, -st*ca, st*sa, a*ct], [st, ct*ca, -ct*sa, a*st], [0, sa, ca, d], [0, 0, 0, 1.0]])
 
     def joint_cb(self, msg):
+        # Read joint states to compute tool orientation matrix
         try:
             names = ['shoulder_pan_joint', 'shoulder_lift_joint', 'elbow_joint', 'wrist_1_joint', 'wrist_2_joint', 'wrist_3_joint']
             q = [msg.position[msg.name.index(n)] for n in names]
@@ -73,19 +83,21 @@ class TouchPosePublisher(Node):
         except (ValueError, IndexError): pass
 
     def raw_pose_cb(self, msg):
+        # Process raw position and orientation received from the haptic device
         pos_raw = np.array([msg.pose.position.x, msg.pose.position.y, msg.pose.position.z])
         curr_pos = np.array([pos_raw[2] / 1000.0, pos_raw[0] / 1000.0, pos_raw[1] / 1000.0])
         
         q_raw = [msg.pose.orientation.x, msg.pose.orientation.y, msg.pose.orientation.z, msg.pose.orientation.w]
         rot_raw = R.from_quat(q_raw)
         
-        # Matrix om voor/achter en rollen definitief goed te zetten
+        # Rotation matrix to correctly align axes and roll with the user preference
         swap = np.array([[-1, 0, 0], [0, 1, 0], [0, 0, -1]])
         curr_rot = R.from_matrix(swap @ rot_raw.as_matrix() @ swap.T)
 
         self.raw_pos = curr_pos
         self.raw_rot = curr_rot
         
+        # Initialize zero-point docking position on startup
         if not self.is_initialized:
             self.startup_samples.append(curr_pos)
             if len(self.startup_samples) >= 25:
@@ -107,6 +119,7 @@ class TouchPosePublisher(Node):
 
         if self.clutched: return
         
+        # Calculate effective relative positions considering clutch offsets
         effective_pos = curr_pos - self.clutch_offset_pos
         effective_rot = self.clutch_offset_rot.inv() * curr_rot
 
@@ -114,6 +127,7 @@ class TouchPosePublisher(Node):
         delta_rot = self.dock_rot.inv() * effective_rot
         delta_q = delta_rot.as_quat()
         
+        # Publish calculated relative target pose for the robot controller
         out_msg = PoseStamped()
         out_msg.header.stamp = self.get_clock().now().to_msg()
         out_msg.header.frame_id = 'base_link'
@@ -127,12 +141,14 @@ class TouchPosePublisher(Node):
         self.pose_pub.publish(out_msg)
 
     def button_cb(self, msg):
+        # Handle physical stylus button clicks for gripper control
         btn_val = msg.data
         if (btn_val & 1) and not (self.prev_btn_state & 1): self.gripper_pub.publish(Bool(data=True))
         elif (btn_val & 2) and not (self.prev_btn_state & 2): self.gripper_pub.publish(Bool(data=False))
         self.prev_btn_state = btn_val
 
     def wrench_cb(self, msg):
+        # Process force/torque sensor measurements and tare/zero the sensor on startup
         sample = np.array([msg.wrench.force.x, msg.wrench.force.y, msg.wrench.force.z])
         self.raw_wrench_force = 0.15 * sample + 0.85 * self.raw_wrench_force
         
@@ -142,10 +158,14 @@ class TouchPosePublisher(Node):
                 self.tare_external_force = np.mean(self.tare_samples, axis=0)
                 self.is_tared = True
                 self.get_logger().info(f'>>> Sensor zero-measurement completed <<<')
+                self.get_logger().info('==============================================================')
+                self.get_logger().info('ALLES GELADEN! Druk nu op [PLAY/RUN] op de UR Teach Pendant')
+                self.get_logger().info('==============================================================')
 
         self.net_external_force = self.raw_wrench_force - self.tare_external_force
 
     def publish_haptic_force(self):
+        # Translate robot contact forces into force feedback for the haptic pen
         f_msg = WrenchStamped()
         f_msg.header.stamp = self.get_clock().now().to_msg()
         f_msg.header.frame_id = 'touch'
@@ -169,6 +189,7 @@ class TouchPosePublisher(Node):
         self.cmd_force_pub.publish(f_msg)
 
     def keyboard_loop(self):
+        # Handle terminal key commands ('e' to engage, 'space' to clutch, 'r' to reset, 'c'/'o' for gripper)
         tty.setcbreak(sys.stdin.fileno())
         try:
             while self.running and rclpy.ok():
@@ -179,14 +200,17 @@ class TouchPosePublisher(Node):
                         if self.raw_pos is not None and self.raw_rot is not None:
                             self.dock_pos = self.raw_pos.copy()
                             self.dock_rot = self.raw_rot
+                            
+                            self.clutched = False
                             self.clutch_offset_pos = np.zeros(3)
                             self.clutch_offset_rot = R.identity()
+                            
                             self.engaged = True
                             self.is_tared = False
                             self.tare_samples = []
                             self.filtered_force = np.zeros(3)
                             self.engage_pub.publish(Bool(data=True))
-                            self.get_logger().info('>>> [ENGAGED] Zero-point & F/T sensor reset! <<<')
+                            self.get_logger().info('>>> [ENGAGED] Clean reset executed! <<<')
                     elif key == 'c': self.gripper_pub.publish(Bool(data=True))
                     elif key == 'o': self.gripper_pub.publish(Bool(data=False))
                     elif key == 'r':

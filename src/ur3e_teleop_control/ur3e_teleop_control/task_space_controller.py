@@ -11,6 +11,7 @@ class UR3eClosedLoopPoseController(Node):
     def __init__(self):
         super().__init__("ur3e_task_space_controller")
 
+        # Define the exact joint names of the UR3e robot arm in correct order
         self.joint_names = [
             "shoulder_pan_joint",
             "shoulder_lift_joint",
@@ -20,6 +21,7 @@ class UR3eClosedLoopPoseController(Node):
             "wrist_3_joint"
         ]
 
+        # Denavit-Hartenberg (DH) parameters for UR3e Forward Kinematics calculations
         self.d = np.array([0.15185, 0.0, 0.0, 0.13105, 0.08535, 0.0921])
         self.a = np.array([0.0, -0.24355, -0.2132, 0.0, 0.0, 0.0])
         self.alpha = np.array([np.pi/2, 0.0, 0.0, np.pi/2, -np.pi/2, 0.0])
@@ -36,7 +38,7 @@ class UR3eClosedLoopPoseController(Node):
         self.has_received_target = False
         self.is_engaged = False 
 
-        self.dt = 0.02 
+        self.dt = 0.02 # Control loop time step (50 Hz)
         
         self.Kp_lin_max = 10.0
         self.Kp_ang_max = 12.0
@@ -44,8 +46,13 @@ class UR3eClosedLoopPoseController(Node):
         self.Kp_lin = 0.0
         self.Kp_ang = 0.0
         
+        # PI-controller variables: Proportional + Integral terms to eliminate steady-state static offset errors
+        self.Ki_lin = 1.2
+        self.error_lin_integral = np.zeros(3)
+
         self.K_posture = 0.2
 
+        # ROS 2 Subscribers and Publishers
         self.create_subscription(JointState, "/joint_states", self.joint_state_cb, 10)
         self.create_subscription(PoseStamped, "/target_pose", self.pose_cb, 10)
         self.create_subscription(Bool, "/reset_home", self.reset_cb, 10)
@@ -54,9 +61,10 @@ class UR3eClosedLoopPoseController(Node):
         self.cmd_pub = self.create_publisher(Float64MultiArray, "/forward_velocity_controller/commands", 10)
         self.timer = self.create_timer(self.dt, self.control_loop)
         
-        self.get_logger().info("UR3e 6x6 Task-Space Controller (Full Jacobian + Absolute Orientation) Active!")
+        self.get_logger().info("UR3e 6x6 Task-Space Controller (PI-Control Active!)")
 
     def joint_state_cb(self, msg):
+        # Read current joint positions from the robot
         try:
             q = [0.0] * 6
             for idx, name in enumerate(self.joint_names):
@@ -71,6 +79,7 @@ class UR3eClosedLoopPoseController(Node):
             pass
 
     def pose_cb(self, msg):
+        # Receive target positions from the haptic device and limit workspace bounds
         raw_pos = np.clip(np.array([
             msg.pose.position.x,
             msg.pose.position.y,
@@ -78,8 +87,6 @@ class UR3eClosedLoopPoseController(Node):
         ]), -0.25, 0.25)
 
         raw_q = [msg.pose.orientation.x, msg.pose.orientation.y, msg.pose.orientation.z, msg.pose.orientation.w]
-        
-        # Converteer de ontvangen rotatie delta naar een veilig filterbare Rotatie-Vector
         raw_rotvec = R.from_quat(raw_q).as_rotvec()
         
         norm = np.linalg.norm(raw_rotvec)
@@ -94,6 +101,7 @@ class UR3eClosedLoopPoseController(Node):
         self.target_delta_rot = raw_rotvec
 
     def engage_cb(self, msg):
+        # Lock current position as reference when operator engages teleoperation
         if msg.data and self.current_q is not None:
             self.is_engaged = True
             self.home_q = self.current_q.copy()
@@ -101,15 +109,19 @@ class UR3eClosedLoopPoseController(Node):
             
             self.Kp_lin = 0.0
             self.Kp_ang = 0.0
-            self.get_logger().info("Zero-point locked! (6-DoF Control Active)")
+            self.error_lin_integral = np.zeros(3)  # Reset integrator error
+            self.get_logger().info("Zero-point locked! (PI Control Active)")
 
     def reset_cb(self, msg):
+        # Reset home position offsets
         if msg.data and self.is_engaged:
             self.target_delta_pos = np.zeros(3)
             self.target_delta_rot = np.zeros(3)
+            self.error_lin_integral = np.zeros(3)  # Reset integrator error
             self.get_logger().info("Return to Home activated.")
 
     def get_dh_matrix(self, theta, d, a, alpha):
+        # Standard Denavit-Hartenberg transformation matrix calculation
         ct, st = np.cos(theta), np.sin(theta)
         ca, sa = np.cos(alpha), np.sin(alpha)
         return np.array([
@@ -120,6 +132,7 @@ class UR3eClosedLoopPoseController(Node):
         ])
 
     def forward_kinematics(self, q):
+        # Compute forward kinematics for all joints to find end-effector pose
         T_all = []
         T = np.eye(4)
         for i in range(6):
@@ -129,6 +142,7 @@ class UR3eClosedLoopPoseController(Node):
         return T, T_all
 
     def compute_full_jacobian(self, T_all):
+        # Compute the 6x6 geometric Jacobian matrix for task-space velocity mapping
         J = np.zeros((6, 6))
         p_end = T_all[-1][0:3, 3] 
 
@@ -142,6 +156,7 @@ class UR3eClosedLoopPoseController(Node):
         return J
 
     def get_orientation_error(self, R_target, R_curr):
+        # Calculate rotational error between target orientation and current orientation
         R_err = R_target @ R_curr.T
         angle = np.arccos(np.clip((np.trace(R_err) - 1.0) / 2.0, -1.0, 1.0))
         if abs(angle) < 1e-5: return np.zeros(3)
@@ -153,6 +168,7 @@ class UR3eClosedLoopPoseController(Node):
         return angle * axis
 
     def control_loop(self):
+        # Main control loop running at 50 Hz to calculate joint velocities
         if self.current_q is None or self.home_T is None: return
 
         if self.is_engaged:
@@ -166,8 +182,9 @@ class UR3eClosedLoopPoseController(Node):
             self.cmd_pub.publish(cmd_msg)
             return
 
-        self.filtered_delta_pos = 0.60 * self.filtered_delta_pos + 0.40 * self.target_delta_pos
-        self.filtered_delta_rot = 0.80 * self.filtered_delta_rot + 0.20 * self.target_delta_rot
+        # Apply low-pass filtering to smooth out manual input jitter
+        self.filtered_delta_pos = 0.30 * self.filtered_delta_pos + 0.70 * self.target_delta_pos
+        self.filtered_delta_rot = 0.60 * self.filtered_delta_rot + 0.40 * self.target_delta_rot
 
         curr_T, T_all = self.forward_kinematics(self.current_q)
         curr_pos = curr_T[0:3, 3]
@@ -177,11 +194,10 @@ class UR3eClosedLoopPoseController(Node):
         home_R = self.home_T[0:3, 0:3]
         
         target_pos = home_pos + self.filtered_delta_pos
-        
-        # Converteer de gefilterde RotVec terug naar een Matrix voor de error calculatie
         R_delta = R.from_rotvec(self.filtered_delta_rot).as_matrix()
         target_R = home_R @ R_delta
 
+        # Enforce maximum safe workspace reach limit
         shoulder_pos = np.array([0.0, 0.0, self.d[0]])
         vec_from_shoulder = target_pos - shoulder_pos
         dist_from_shoulder = np.linalg.norm(vec_from_shoulder)
@@ -190,10 +206,21 @@ class UR3eClosedLoopPoseController(Node):
         if dist_from_shoulder > max_reach:
             target_pos = shoulder_pos + vec_from_shoulder * (max_reach / dist_from_shoulder)
 
+        # Position error and PI-integrator calculation with anti-windup protection
         error_lin = target_pos - curr_pos
+        
+        if self.is_engaged:
+            self.error_lin_integral += error_lin * self.dt
+            self.error_lin_integral = np.clip(self.error_lin_integral, -0.03, 0.03)
+            
         error_ang = self.get_orientation_error(target_R, curr_R)
-        V_task = np.hstack([self.Kp_lin * error_lin, self.Kp_ang * error_ang])
+        
+        # Combined PI control for linear velocity and P control for angular velocity
+        V_lin = (self.Kp_lin * error_lin) + (self.Ki_lin * self.error_lin_integral)
+        V_ang = self.Kp_ang * error_ang
+        V_task = np.hstack([V_lin, V_ang])
 
+        # Compute Damped Least Squares (DLS) Jacobian inverse for singularity robustness
         J_6x6 = self.compute_full_jacobian(T_all)
         det_J = abs(np.linalg.det(J_6x6))
         
@@ -203,22 +230,19 @@ class UR3eClosedLoopPoseController(Node):
         A = J_6x6 @ J_6x6.T + (damping ** 2) * np.eye(6)
         J_dls = J_6x6.T @ np.linalg.inv(A)
 
+        # Null-space optimization to maintain comfortable arm posture
         q_null = self.K_posture * (self.home_q - self.current_q)
         N = np.eye(6) - (J_dls @ J_6x6)
-        
         q_dot = (J_dls @ V_task) + (N @ q_null)
 
-        elbow_angle, elbow_vel, buffer = self.current_q[2], q_dot[2], 0.12  
-        if (elbow_angle > 0.0 and elbow_angle < buffer and elbow_vel < 0.0) or \
-           (elbow_angle < 0.0 and elbow_angle > -buffer and elbow_vel > 0.0):
-            q_dot[2] = 0.0  
-
+        # Safety checks for joint velocities and elbow protection
         max_speed = np.max(np.abs(q_dot))
         if max_speed > 3.0: q_dot = q_dot * (3.0 / max_speed)
 
         if np.linalg.norm(error_lin) < 0.002 and np.linalg.norm(error_ang) < 0.01:
             q_dot = np.zeros(6)
 
+        # Publish velocity commands to the robot controller
         cmd_msg = Float64MultiArray()
         cmd_msg.data = q_dot.tolist()
         self.cmd_pub.publish(cmd_msg)

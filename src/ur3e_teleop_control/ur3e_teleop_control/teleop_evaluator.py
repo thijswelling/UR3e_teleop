@@ -13,12 +13,12 @@ class TeleopEvaluator(Node):
     def __init__(self):
         super().__init__('teleop_evaluator')
         
-        # UR3e DH parameters voor Forward Kinematics
+        # UR3e Denavit-Hartenberg parameters used for Forward Kinematics calculations during evaluation
         self.d = np.array([0.15185, 0.0, 0.0, 0.13105, 0.08535, 0.0921])
         self.a = np.array([0.0, -0.24355, -0.2132, 0.0, 0.0, 0.0])
         self.alpha = np.array([np.pi/2, 0.0, 0.0, np.pi/2, -np.pi/2, 0.0])
 
-        # Data opslag arrays
+        # Data logging arrays and state flags
         self.is_engaged = False
         self.home_pos = None
         
@@ -28,7 +28,7 @@ class TeleopEvaluator(Node):
         self.robot_force = {'t': [], 'fx': [], 'fy': [], 'fz': []}
         self.haptic_force = {'t': [], 'fx': [], 'fy': [], 'fz': []}
 
-        # Subscribers
+        # Subscribers to collect real-time tracking and force data
         self.create_subscription(JointState, '/joint_states', self.joint_cb, 10)
         self.create_subscription(PoseStamped, '/target_pose', self.target_cb, 10)
         self.create_subscription(Bool, '/engage_orientation', self.engage_cb, 10)
@@ -36,7 +36,7 @@ class TeleopEvaluator(Node):
         self.create_subscription(WrenchStamped, '/touch/cmd_force', self.haptic_force_cb, 10)
 
         self.start_time = None
-        self.get_logger().info("Evaluator gestart. Druk op 'e' in je teleop terminal om het loggen te starten. Druk op Ctrl+C om de grafieken te genereren.")
+        self.get_logger().info("Evaluator started. Press 'e' in your teleop terminal to start logging. Press Ctrl+C to generate plots.")
 
     def get_time(self):
         return self.get_clock().now().nanoseconds / 1e9
@@ -56,6 +56,7 @@ class TeleopEvaluator(Node):
         return T[0:3, 3]
 
     def engage_cb(self, msg):
+        # Reset logging arrays and start recording data upon engagement
         if msg.data:
             self.is_engaged = True
             self.start_time = self.get_time()
@@ -65,9 +66,10 @@ class TeleopEvaluator(Node):
             self.robot_force = {'t': [], 'fx': [], 'fy': [], 'fz': []}
             self.haptic_force = {'t': [], 'fx': [], 'fy': [], 'fz': []}
             
-            self.get_logger().info("Engaged! Data wordt nu opgeslagen voor evaluatie...")
+            self.get_logger().info("Engaged! Recording performance data for evaluation...")
 
     def joint_cb(self, msg):
+        # Compute actual robot end-effector position using joint states
         if not self.is_engaged: return
         try:
             names = ['shoulder_pan_joint', 'shoulder_lift_joint', 'elbow_joint']
@@ -86,6 +88,7 @@ class TeleopEvaluator(Node):
             pass
 
     def target_cb(self, msg):
+        # Log target positions coming from the haptic device
         if not self.is_engaged or self.home_pos is None: return
         target_abs_x = self.home_pos[0] + msg.pose.position.x
         target_abs_y = self.home_pos[1] + msg.pose.position.y
@@ -114,11 +117,12 @@ class TeleopEvaluator(Node):
         self.haptic_force['fz'].append(msg.wrench.force.z)
 
     def plot_results(self):
+        # Process logged telemetry and generate comprehensive tracking accuracy and force feedback plots
         if len(self.target_data['t']) < 10 or len(self.robot_data['t']) < 10:
-            self.get_logger().info("Niet genoeg data verzameld om te plotten.")
+            self.get_logger().info("Not enough data collected to generate plots.")
             return
 
-        self.get_logger().info("Genereren van grafieken... Dit kan een moment duren.")
+        self.get_logger().info("Generating evaluation graphs... Please wait.")
 
         t_tar = np.array(self.target_data['t'])
         pos_tar = np.array([self.target_data['x'], self.target_data['y'], self.target_data['z']])
@@ -126,53 +130,49 @@ class TeleopEvaluator(Node):
         t_rob = np.array(self.robot_data['t'])
         pos_rob = np.array([self.robot_data['x'], self.robot_data['y'], self.robot_data['z']])
 
-        # --- Interpolatie voor Foutberekening (Tijdlijnen synchroniseren) ---
+        # Synchronize timelines via interpolation for accurate error calculation
         rob_x_interp = np.interp(t_tar, t_rob, pos_rob[0])
         rob_y_interp = np.interp(t_tar, t_rob, pos_rob[1])
         rob_z_interp = np.interp(t_tar, t_rob, pos_rob[2])
         
-        # Euclidische afstandsfout per meetpunt
+        # Calculate Euclidean tracking error per sample point
         error = np.sqrt((pos_tar[0] - rob_x_interp)**2 + 
                         (pos_tar[1] - rob_y_interp)**2 + 
                         (pos_tar[2] - rob_z_interp)**2)
 
-        # Bereken de Cumulatieve RMSE over de tijd
+        # Compute cumulative Root Mean Square Error (RMSE) over time in millimeters
         squared_error = error**2
         cum_mean_sq_error = np.cumsum(squared_error) / np.arange(1, len(squared_error) + 1)
-        rmse_over_time = np.sqrt(cum_mean_sq_error) * 1000  # Omgezet naar millimeters
+        rmse_over_time = np.sqrt(cum_mean_sq_error) * 1000
 
-        # ==========================================
-        # FIGUUR 1: POSITIE EN KINEMATISCHE ACCURAATHEID (Ruimtelijk)
-        # ==========================================
+        # FIGURE 1: Spatial Trajectories (2D planes and 3D overlay)
         fig1 = plt.figure(figsize=(16, 10))
-        fig1.canvas.manager.set_window_title('Ruimtelijk: 2D & 3D Trajecten')
+        fig1.canvas.manager.set_window_title('Spatial: 2D & 3D Trajectories')
 
         ax1 = fig1.add_subplot(2, 2, 1)
         ax1.plot(pos_tar[0], pos_tar[1], 'r--', label='Omni Target', linewidth=2)
         ax1.plot(pos_rob[0], pos_rob[1], 'b-', label='UR3e', alpha=0.7)
-        ax1.set_title("Bovenaanzicht (X-Y Vlak)")
+        ax1.set_title("Top View (X-Y Plane)")
         ax1.set_xlabel("X (m)"); ax1.set_ylabel("Y (m)")
         ax1.legend(); ax1.grid(True)
 
         ax2 = fig1.add_subplot(2, 2, 2)
         ax2.plot(pos_tar[0], pos_tar[2], 'r--', label='Omni Target', linewidth=2)
         ax2.plot(pos_rob[0], pos_rob[2], 'b-', label='UR3e', alpha=0.7)
-        ax2.set_title("Vooraanzicht (X-Z Vlak)")
+        ax2.set_title("Front View (X-Z Plane)")
         ax2.set_xlabel("X (m)"); ax2.set_ylabel("Z (m)")
         ax2.legend(); ax2.grid(True)
 
         ax4 = fig1.add_subplot(2, 1, 2, projection='3d')
         ax4.plot(pos_tar[0], pos_tar[1], pos_tar[2], 'r--', label='Target')
         ax4.plot(pos_rob[0], pos_rob[1], pos_rob[2], 'b-', label='UR3e', alpha=0.7)
-        ax4.set_title("3D Traject Overlay")
+        ax4.set_title("3D Trajectory Overlay")
         ax4.set_xlabel("X"); ax4.set_ylabel("Y"); ax4.set_zlabel("Z")
         ax4.legend()
 
-        # ==========================================
-        # FIGUUR 2: KRACHTEN FEEDBACK (HAPTICS)
-        # ==========================================
+        # FIGURE 2: Force Feedback Comparison (F/T Sensor vs Haptic Output)
         fig2 = plt.figure(figsize=(16, 6))
-        fig2.canvas.manager.set_window_title('Krachten: F/T Sensor vs Haptic Output')
+        fig2.canvas.manager.set_window_title('Forces: Robot Sensor vs Haptic Output')
 
         t_rf = np.array(self.robot_force['t'])
         t_hf = np.array(self.haptic_force['t'])
@@ -180,56 +180,53 @@ class TeleopEvaluator(Node):
         ax_fx = fig2.add_subplot(1, 3, 1)
         ax_fx.plot(t_rf, self.robot_force['fx'], label='Robot Sensor (X)', color='gray', alpha=0.5)
         ax_fx.plot(t_hf, self.haptic_force['fx'], label='Haptic Output (X)', color='red')
-        ax_fx.set_title("Krachten X-As"); ax_fx.set_xlabel("Tijd (s)"); ax_fx.set_ylabel("Kracht (N)")
+        ax_fx.set_title("Forces X-Axis"); ax_fx.set_xlabel("Time (s)"); ax_fx.set_ylabel("Force (N)")
         ax_fx.legend(); ax_fx.grid(True)
 
         ax_fy = fig2.add_subplot(1, 3, 2)
         ax_fy.plot(t_rf, self.robot_force['fy'], label='Robot Sensor (Y)', color='gray', alpha=0.5)
         ax_fy.plot(t_hf, self.haptic_force['fy'], label='Haptic Output (Y)', color='green')
-        ax_fy.set_title("Krachten Y-As"); ax_fy.set_xlabel("Tijd (s)")
+        ax_fy.set_title("Forces Y-Axis"); ax_fy.set_xlabel("Time (s)")
         ax_fy.legend(); ax_fy.grid(True)
 
         ax_fz = fig2.add_subplot(1, 3, 3)
         ax_fz.plot(t_rf, self.robot_force['fz'], label='Robot Sensor (Z)', color='gray', alpha=0.5)
         ax_fz.plot(t_hf, self.haptic_force['fz'], label='Haptic Output (Z)', color='blue')
-        ax_fz.set_title("Krachten Z-As"); ax_fz.set_xlabel("Tijd (s)")
+        ax_fz.set_title("Forces Z-Axis"); ax_fz.set_xlabel("Time (s)")
         ax_fz.legend(); ax_fz.grid(True)
 
-        # ==========================================
-        # FIGUUR 3: TIJDSDOMEIN (X, Y, Z OVER TIJD) & RMSE
-        # ==========================================
+        # FIGURE 3: Temporal Domain (Position per axis over time & Cumulative RMSE)
         fig3 = plt.figure(figsize=(16, 10))
-        fig3.canvas.manager.set_window_title('Tijdsdomein: Positie per as & RMSE Foutmarge')
+        fig3.canvas.manager.set_window_title('Time Domain: Position per Axis & RMSE Error Margin')
 
         ax_x = fig3.add_subplot(2, 2, 1)
         ax_x.plot(t_tar, pos_tar[0], 'r--', label='Omni Target X')
         ax_x.plot(t_rob, pos_rob[0], 'b-', label='UR3e X', alpha=0.7)
-        ax_x.set_title("X Positie over Tijd (Check hier op vertraging/lag)")
-        ax_x.set_xlabel("Tijd (s)"); ax_x.set_ylabel("Positie X (m)")
+        ax_x.set_title("X Position over Time (Check for latency/lag)")
+        ax_x.set_xlabel("Time (s)"); ax_x.set_ylabel("Position X (m)")
         ax_x.legend(); ax_x.grid(True)
 
         ax_y = fig3.add_subplot(2, 2, 2)
         ax_y.plot(t_tar, pos_tar[1], 'r--', label='Omni Target Y')
         ax_y.plot(t_rob, pos_rob[1], 'b-', label='UR3e Y', alpha=0.7)
-        ax_y.set_title("Y Positie over Tijd")
-        ax_y.set_xlabel("Tijd (s)"); ax_y.set_ylabel("Positie Y (m)")
+        ax_y.set_title("Y Position over Time")
+        ax_y.set_xlabel("Time (s)"); ax_y.set_ylabel("Position Y (m)")
         ax_y.legend(); ax_y.grid(True)
 
         ax_z = fig3.add_subplot(2, 2, 3)
         ax_z.plot(t_tar, pos_tar[2], 'r--', label='Omni Target Z')
         ax_z.plot(t_rob, pos_rob[2], 'b-', label='UR3e Z', alpha=0.7)
-        ax_z.set_title("Z Positie over Tijd")
-        ax_z.set_xlabel("Tijd (s)"); ax_z.set_ylabel("Positie Z (m)")
+        ax_z.set_title("Z Position over Time")
+        ax_z.set_xlabel("Time (s)"); ax_z.set_ylabel("Position Z (m)")
         ax_z.legend(); ax_z.grid(True)
 
-        # RMSE en Absolute fout plot
         ax_rmse = fig3.add_subplot(2, 2, 4)
-        ax_rmse.plot(t_tar, error * 1000, color='gray', alpha=0.4, label='Huidige Fout (Instantaan)')
-        ax_rmse.plot(t_tar, rmse_over_time, 'm-', linewidth=2.5, label='Cumulatieve RMSE')
+        ax_rmse.plot(t_tar, error * 1000, color='gray', alpha=0.4, label='Instantaneous Error')
+        ax_rmse.plot(t_tar, rmse_over_time, 'm-', linewidth=2.5, label='Cumulative RMSE')
         
         final_rmse = rmse_over_time[-1]
-        ax_rmse.set_title(f"Systeem Foutmarge (Eind RMSE: {final_rmse:.2f} mm)")
-        ax_rmse.set_xlabel("Tijd (s)"); ax_rmse.set_ylabel("Fout (mm)")
+        ax_rmse.set_title(f"System Error Margin (Final RMSE: {final_rmse:.2f} mm)")
+        ax_rmse.set_xlabel("Time (s)"); ax_rmse.set_ylabel("Error (mm)")
         ax_rmse.legend(); ax_rmse.grid(True)
 
         plt.tight_layout()
