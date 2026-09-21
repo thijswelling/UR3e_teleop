@@ -1,72 +1,54 @@
-# UR3e Bilateral Haptic Teleoperation with 3D Systems Touch (ROS 2)
+# UR3e 6-DoF Haptic Teleoperation System
 
-Complete bilateral teleoperation pipeline for a Universal Robots UR3e and Robotiq Hand-E gripper with real-time force feedback via a 3D Systems Touch haptic device in ROS 2 Humble.
+A high-performance ROS 2 Humble teleoperation pipeline connecting a **3D Systems Touch (Phantom Omni)** haptic device to a **Universal Robots UR3e** robotic arm equipped with a **Robotiq Hand-E** gripper and a Force/Torque feedback.
 
----
-
-## System Architecture
-
-1. **Hardware Bridge (`touch_haptics/touch_haptic_bridge` - C++)**:
-   - Runs an asynchronous 1000 Hz OpenHaptics scheduler loop for stable haptic force rendering.
-   - Includes a startup hardware interlock to prevent streaming zero-vectors before device initialisation.
-   - Topics: `/touch/raw_pose` (20 Hz), `/touch/buttons` (20 Hz), `/touch/cmd_force` (in).
-
-2. **Gripper Bridge (`ur3e_teleop_control/robotiq_bridge` - Python)**:
-   - Connects directly to the UR controller Robotiq daemon via TCP/IP socket (port 63352).
-   - Translates high-level gripper commands into native Hand-E actuation commands with a conservative grasping force preset (~20–25 N) to protect delicate objects like cables.
-   - Topic: `/gripper/cmd` (in).
-
-3. **Teleop Publisher (`ur3e_teleop_control/touch_publisher` - Python)**:
-   - Handles stylus offsets, clutching, filtering, workspace scaling, and gripper button events.
-   - Safety Interlock: locks pose streaming until the tare/engage key is triggered by the user.
-   - Rotates wrist F/T sensor wrenches into the robot's `base_link` frame using forward kinematics (DH parameters).
-   - Maps 3D interaction forces to counter-forces on the Touch stylus with a 2.2 N deadband and EWMA smoothing.
-   - Topics: `/target_pose` (out), `/gripper/cmd` (out), `/touch/cmd_force` (out).
-
-4. **Task-Space Controller (`ur3e_teleop_control/task_space_controller` - Python)**:
-   - Closed-loop DLS (Damped Least Squares) Jacobian inverse kinematics.
-   - Startup interlock: commands zero velocity until a valid target pose is received.
-   - Postural null-space projection towards the home configuration.
-   - Topic: `/forward_velocity_controller/commands`.
+## Features
+* **6-DoF Task-Space Control:** Full spatial position and absolute orientation tracking using a geometric Jacobian with Damped Least Squares (DLS).
+* **PI-Control with Anti-Windup:** Guarantees zero steady-state tracking error and eliminates static offsets.
+* **Haptic Force Feedback:** Translates real-time external forces measured by the robot's F/T sensor back into force feedback for the operator's haptic pen.
+* **Gripper Integration:** Seamless socket communication bridge for the Robotiq Hand-E gripper.
+* **Performance Evaluation Node:** Built-in logger (`TeleopEvaluator`) to track trajectory accuracy and compute Root Mean Square Error (RMSE).
 
 ---
 
-## Quick Start (Single Command)
-
-Execute the startup script from the workspace root (pass your robot IP as an argument):
-
-~/ros2_ws/start_teleop.sh <Robot_IP>    # <- change "<Robot_IP" to 192.168.0.134 (On teach pendant, find/change in Settings-Network-IP address)
-
-Press `Ctrl+C` in this terminal to terminate all nodes and processes cleanly.
-
----
-
-## Manual Startup Sequence (Alternative)
-
-If debugging individual modules, launch each in a separate terminal:
-
-1. **Terminal 1 (UR Driver)**:
-   ros2 launch ur_robot_driver ur_control.launch.py ur_type:=ur3e robot_ip:=<ROBOT_IP> launch_rviz:=false initial_joint_controller:=forward_velocity_controller
-
-2. **Terminal 2 (Gripper Socket Bridge)**:
-   ros2 run ur3e_teleop_control robotiq_bridge --ros-args -p robot_ip:=<ROBOT_IP>
-
-3. **Terminal 3 (Kinematics Controller)**:
-   ros2 run ur3e_teleop_control task_space_controller
-
-4. **Terminal 4 (1000 Hz Haptic Bridge)**:
-   ros2 run touch_haptics touch_haptic_bridge
-
-5. **Terminal 5 (Interactive Teleop Node)**:
-   ros2 run ur3e_teleop_control touch_publisher
+## System Architecture & Nodes
+1. **`touch_haptic_bridge` (C++):** Interfacing directly with the OpenHaptics library at high frequency to read device positioning and apply force feedback.
+2. **`touch_publisher` (Python):** Handles coordinate mapping, scaling, workspace limits, button inputs, and keyboard engagement commands (`[e]` to engage/align pen to gripper, `[SPACE]` for clutch, `[r]` to reset to start position).
+3. **`task_space_controller` (Python):** Computes forward kinematics, Jacobians, and closed-loop PI velocity controller.
+4. **`robotiq_bridge` (Python):** Manages TCP socket communication with the Robotiq gripper controller.
+5. **`teleop_evaluator` (Python):** Records performance and generates spatial, temporal, and force plots.
 
 ---
 
-## Controls & Keybindings (Active in Teleop Terminal)
+## Getting Started
 
-- [e]       : Engage & Tare (Locks origin, activates orientation tracking, tares F/T sensor)
-- [SPACE]   : Clutch toggle (Freezes robot pose; allows repositioning stylus)
-- [c]       : Close gripper (or Stylus Button 1)
-- [o]       : Open gripper (or Stylus Button 2)
-- [r]       : Reset Home (Returns target reference to home position)
-- [Ctrl+C]  : Safe shutdown
+### Prerequisites
+* ROS 2 Humble
+* Ubuntu 22.04 LTS
+* OpenHaptics SDK & 3D Systems Touch drivers
+* Universal Robots ROS 2 Driver
+
+### Installation -> Build -> Run
+Clone the repository into your ROS 2 workspace source folder and build it:
+cd ~/ros2_ws/src
+git clone [https://github.com/thijswelling/UR3e_teleop.git](https://github.com/thijswelling/UR3e_teleop.git)
+cd ~/ros2_ws
+colcon build --symlink-install
+source install/setup.bash
+
+Launch all nodes in order with launch file:
+cd ~/ros2_ws ./start_teleop.sh 192.168.0.134
+
+Press play button on teach pendant when terminal gives:
+==============================================================
+ALLES GELADEN! Druk nu op [PLAY/RUN] op de UR Teach Pendant
+==============================================================
+
+Optional teleop_evaluator.py for position and force tracking graphs:
+1. Start the main teleop launch file and press [PLAY/RUN] on the UR Teach Pendant.
+2. Open a new terminal and run the evaluator node: ros2 run ur3e_teleop_control teleop_evaluator
+3. Press [e] in your primary teleop terminal to engage the system and automatically start logging data.
+4. Press Ctrl+C in the evaluator terminal to stop the session and display the graphs.
+
+
+
