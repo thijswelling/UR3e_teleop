@@ -36,6 +36,7 @@ class TeleopEvaluator(Node):
         self.create_subscription(WrenchStamped, '/touch/cmd_force', self.haptic_force_cb, 10)
 
         self.start_time = None
+
         self.get_logger().info("Evaluator started. Press 'e' in your teleop terminal to start logging. Press Ctrl+C to generate plots.")
 
     def get_time(self):
@@ -51,7 +52,8 @@ class TeleopEvaluator(Node):
 
     def forward_kinematics(self, q):
         T = np.eye(4)
-        for i in range(3):
+        # [AANGEPAST] Fix 4: Neem alle 6 assen mee in plaats van 3
+        for i in range(6):
             T = T @ self.get_dh_matrix(q[i], self.d[i], self.a[i], self.alpha[i])
         return T[0:3, 3]
 
@@ -72,7 +74,8 @@ class TeleopEvaluator(Node):
         # Compute actual robot end-effector position using joint states
         if not self.is_engaged: return
         try:
-            names = ['shoulder_pan_joint', 'shoulder_lift_joint', 'elbow_joint']
+            # [AANGEPAST] Fix 4: Voeg joints 4, 5 en 6 toe
+            names = ['shoulder_pan_joint', 'shoulder_lift_joint', 'elbow_joint', 'wrist_1_joint', 'wrist_2_joint', 'wrist_3_joint']
             q = [msg.position[msg.name.index(n)] for n in names]
             pos = self.forward_kinematics(q)
             

@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import rclpy
 from rclpy.node import Node
 import numpy as np
@@ -40,7 +41,7 @@ class UR3eClosedLoopPoseController(Node):
 
         self.dt = 0.02 # Control loop time step (50 Hz)
         
-        self.Kp_lin_max = 10.0
+        self.Kp_lin_max = 13
         self.Kp_ang_max = 12.0
         
         self.Kp_lin = 0.0
@@ -49,8 +50,6 @@ class UR3eClosedLoopPoseController(Node):
         # PI-controller variables: Proportional + Integral terms to eliminate steady-state static offset errors
         self.Ki_lin = 1.2
         self.error_lin_integral = np.zeros(3)
-
-        self.K_posture = 0.2
 
         # ROS 2 Subscribers and Publishers
         self.create_subscription(JointState, "/joint_states", self.joint_state_cb, 10)
@@ -159,7 +158,10 @@ class UR3eClosedLoopPoseController(Node):
         # Calculate rotational error between target orientation and current orientation
         R_err = R_target @ R_curr.T
         angle = np.arccos(np.clip((np.trace(R_err) - 1.0) / 2.0, -1.0, 1.0))
-        if abs(angle) < 1e-5: return np.zeros(3)
+        
+        # [AANGEPAST] Fix 5: Voorkom divide-by-zero bij 180 graden rotatiefout
+        if abs(angle) < 1e-5 or abs(np.sin(angle)) < 1e-5: return np.zeros(3)
+        
         axis = np.array([
             R_err[2, 1] - R_err[1, 2],
             R_err[0, 2] - R_err[2, 0],
@@ -184,7 +186,9 @@ class UR3eClosedLoopPoseController(Node):
 
         # Apply low-pass filtering to smooth out manual input jitter
         self.filtered_delta_pos = 0.30 * self.filtered_delta_pos + 0.70 * self.target_delta_pos
-        self.filtered_delta_rot = 0.60 * self.filtered_delta_rot + 0.40 * self.target_delta_rot
+        
+        # [AANGEPAST] Fix 2: Verwijder de lineaire filter over de as/hoek vector!
+        self.filtered_delta_rot = self.target_delta_rot
 
         curr_T, T_all = self.forward_kinematics(self.current_q)
         curr_pos = curr_T[0:3, 3]
@@ -209,6 +213,11 @@ class UR3eClosedLoopPoseController(Node):
         # Position error and PI-integrator calculation with anti-windup protection
         error_lin = target_pos - curr_pos
         
+        # Begrens de fout tot max 25 millimeter voor zachte, veilige botsingen
+        err_norm = np.linalg.norm(error_lin)
+        if err_norm > 0.025:
+            error_lin = error_lin * (0.025 / err_norm)
+        
         if self.is_engaged:
             self.error_lin_integral += error_lin * self.dt
             self.error_lin_integral = np.clip(self.error_lin_integral, -0.03, 0.03)
@@ -230,10 +239,8 @@ class UR3eClosedLoopPoseController(Node):
         A = J_6x6 @ J_6x6.T + (damping ** 2) * np.eye(6)
         J_dls = J_6x6.T @ np.linalg.inv(A)
 
-        # Null-space optimization to maintain comfortable arm posture
-        q_null = self.K_posture * (self.home_q - self.current_q)
-        N = np.eye(6) - (J_dls @ J_6x6)
-        q_dot = (J_dls @ V_task) + (N @ q_null)
+        # [AANGEPAST] Fix 3: Null-space projectie verwijderd bij een 6-DOF arm om gevaarlijke bewegingen te voorkomen
+        q_dot = J_dls @ V_task
 
         # Safety checks for joint velocities and elbow protection
         max_speed = np.max(np.abs(q_dot))
